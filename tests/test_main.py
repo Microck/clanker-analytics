@@ -1948,9 +1948,9 @@ def _codex_tokens(timestamp, total, last=None):
     return _codex_line(timestamp, "event_msg", {"type": "token_count", "info": info})
 
 
-def _claude_line(timestamp, output, message_id=None):
+def _claude_line(timestamp, output, message_id=None, session="s1"):
     return json.dumps({
-        "type": "assistant", "timestamp": timestamp, "sessionId": "s1", "cwd": "/code/alpha",
+        "type": "assistant", "timestamp": timestamp, "sessionId": session, "cwd": "/code/alpha",
         "message": {"id": message_id or f"msg_{timestamp}", "model": "claude-opus-4-6", "usage": {
             "input_tokens": 5, "output_tokens": output, "cache_creation_input_tokens": 0,
             "cache_read_input_tokens": 100}},
@@ -1965,28 +1965,50 @@ class TestClaudeHomes(Case):
         subagents = project / session / "subagents"
         subagents.mkdir(parents=True)
         (project / f"{session}.jsonl").write_text(
-            _claude_line("2026-10-08T10:00:01Z", 6, "msg_a")
-            + _claude_line("2026-10-08T10:00:02Z", 1682, "msg_a"))
-        (subagents / "agent-1.jsonl").write_text(_claude_line("2026-10-08T10:00:03Z", 40, "msg_b"))
+            _claude_line("2026-10-08T10:00:01Z", 6, "msg_a", session)
+            + _claude_line("2026-10-08T10:00:02Z", 1682, "msg_a", session))
+        (subagents / "agent-1.jsonl").write_text(
+            _claude_line("2026-10-08T10:00:03Z", 40, "msg_b", session))
         (subagents / "agent-acompact-1.jsonl").write_text(
-            _claude_line("2026-10-08T10:00:04Z", 9, "msg_c"))
-        (project / "other.jsonl").write_text(_claude_line("2026-10-08T10:00:05Z", 7, "msg_d"))
+            _claude_line("2026-10-08T10:00:04Z", 9, "msg_c", session))
+        (project / "other.jsonl").write_text(_claude_line("2026-10-08T10:00:05Z", 7, "msg_d", "other"))
         self.monkeypatch.setattr(main_mod, "HOME", home.as_posix())
         self.monkeypatch.setenv("XDG_CONFIG_HOME", str(self.tmp_path / "config"))
         self.monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         self.monkeypatch.setattr(main_mod, "refresh_prices", lambda: None)
+        self.monkeypatch.setattr(main_mod, "_WSL_HOMES", [])
+        self.monkeypatch.setattr(main_mod, "SOURCE_TREES", main_mod._home_trees())
         capsys = self.capsys
 
         assert main_mod.main(["session-costs", "0a1b2c3d", "--json"]) == 0
 
         report = json.loads(capsys.readouterr().out)
-        assert report["session"] == session
+        assert (report["tool"], report["session"]) == ("Claude Code", session)
         assert [(item["message_id"], item["output_tokens"], item["timestamp"])
                 for item in report["responses"]] == [
             ("msg_a", 1682, "2026-10-08T10:00:02.000Z"), ("msg_b", 40, "2026-10-08T10:00:03.000Z")]
         assert all(item["api_cost_usd"] > 0 for item in report["responses"])
-        with raises(SystemExit, match="no Claude Code session"):
+        with raises(SystemExit, match="no session 'ffff'"):
             main_mod.main(["session-costs", "ffff"])
+
+        # A Codex session is found by its thread id, which ends the log's name.
+        thread = "019fbf17-f0ea-71a0-856a-505b89d7d50d"
+        log = home / ".codex" / "sessions" / "2026" / "10" / "08" / f"rollout-2026-10-08T10-00-00-{thread}.jsonl"
+        log.parent.mkdir(parents=True)
+        log.write_text(
+            _codex_line("2026-10-08T10:00:00Z", "session_meta", {"id": thread, "cwd": "/code/beta"})
+            + _codex_line("2026-10-08T10:00:01Z", "turn_context", {"model": "gpt-5.5"})
+            + _codex_tokens("2026-10-08T10:00:20Z", 100, 100))
+        self.monkeypatch.setattr(main_mod, "SOURCE_TREES", main_mod._home_trees())
+        assert main_mod.main(["session-costs", "019fbf17", "--json"]) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert (report["tool"], report["session"], len(report["responses"])) == ("Codex", thread, 1)
+
+        # A prefix of both sessions' ids is ambiguous.
+        (project / "019fbf17-0000.jsonl").write_text(
+            _claude_line("2026-10-08T10:00:09Z", 1, "msg_e", "019fbf17-0000"))
+        with raises(SystemExit, match="matches 2 sessions"):
+            main_mod.main(["session-costs", "019fbf17"])
 
     def test_claude_homes_come_from_the_environment_and_clanker_usage(self):
         home = self.tmp_path / "home"

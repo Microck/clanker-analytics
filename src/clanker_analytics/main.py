@@ -2478,26 +2478,33 @@ SESSION_COST_COLUMNS = (
     "api_cost_usd", "pricing", "source_file")
 
 
-def _session_transcripts(session: str) -> list[str]:
-    """The transcript of the Claude Code session whose id is or starts with session, and
-    its subagents' transcripts, in every Claude Code home."""
-    found: dict[str, list[str]] = {}
-    for home in (Path(HOME) / ".claude", *_claude_config_dirs()):
-        for transcript in (home / "projects").glob(f"*/{glob_escape(session)}*.jsonl"):
-            subagents = transcript.with_suffix("") / "subagents"
-            found.setdefault(transcript.stem, []).extend(
-                path.as_posix() for path in [transcript, *sorted(subagents.glob("agent-*.jsonl"))]
-                if "agent-acompact-" not in path.name)
-    if len(found) > 1:
-        raise SystemExit(f"error: {session!r} matches {len(found)} sessions: "
-                         + ", ".join(sorted(found)))
-    if not found:
-        raise SystemExit(f"error: no Claude Code session {session!r}")
-    return next(iter(found.values()))
+def _session_sources(session: str) -> dict[str, SourceSnapshot]:
+    """The source files that can hold the session whose id is or starts with session, in
+    every harness: found by the names harnesses give a session's files, plus Zcode's
+    database, which holds every Zcode session."""
+    prefix = glob_escape(session)
+    patterns = {
+        "Claude Code": [f"*/{prefix}*.jsonl", f"*/{prefix}*/subagents/agent-*.jsonl"],
+        "Codex": [f"**/rollout-*-{prefix}*.jsonl"],
+        # A Gemini CLI chat's name ends in the first 8 characters of its session id.
+        "Gemini": [f"*/chats/session-*-{glob_escape(session[:8])}*.json",
+                   f"*/chats/session-*-{glob_escape(session[:8])}*.jsonl"],
+        "Agy": [f"{prefix}*/.system_generated/logs/transcript_full.jsonl"],
+        MUSE_TOOL: [f"*/*/*/{prefix}*/session.jsonl", f"*/*/*/{prefix}*/subagent/*/session.jsonl"],
+        ZCODE_TOOL: ["db.sqlite"],
+    }
+    roots = {(tool, root) for tool, root, _ in _iter_source_trees() if tool in patterns}
+    found: dict[str, SourceSnapshot] = {}
+    for tool, root in sorted(roots, key=lambda item: (item[0], str(item[1]))):
+        for pattern in patterns[tool]:
+            for path in root.glob(pattern):
+                if path.is_file() and "agent-acompact-" not in path.name:
+                    found[path.as_posix()] = SourceSnapshot(tool, 0, path.stat().st_size)
+    return found
 
 
 def glob_escape(text: str) -> str:
-    return re.sub(r"([*?\[])", r"[\1]", text)
+    return re.sub(r"([*?\\[])", r"[\\1]", text)
 
 
 def _session_costs(session: str, as_json: bool, timer: DebugTimer) -> int:
@@ -2506,13 +2513,23 @@ def _session_costs(session: str, as_json: bool, timer: DebugTimer) -> int:
     A response a forked or resumed session copied from another is included here, since its
     copy carries this session's id; the full cache counts each copy once across sessions.
     """
-    with timer.span("find transcripts", session):
-        paths = _session_transcripts(session)
+    with timer.span("find session files", session):
+        files = _session_sources(session)
     db = duckdb.connect()
     _empty_tokens_table(db)
-    with timer.span("read transcripts", f"{len(paths)} files"):
-        db.execute(f"INSERT INTO tokens BY NAME {_claude_sql(_sql_file_list(paths))}")
+    with timer.span("read session files", f"{len(files)} files"):
+        _insert_source_files(db, files)
+        db.execute("DELETE FROM tokens WHERE NOT starts_with(coalesce(session, ''), ?)",
+                   [session])
         _count_claude_messages_once(db, timer)
+    matches = db.execute("SELECT DISTINCT tool, session FROM tokens ORDER BY ALL").fetchall()
+    if not matches:
+        raise SystemExit(f"error: no session {session!r} with recorded usage")
+    if len(matches) > 1:
+        listed = ", ".join(f"{tool} {found}" for tool, found in matches[:5])
+        raise SystemExit(f"error: {session!r} matches {len(matches)} sessions: {listed}"
+                         + (", ..." if len(matches) > 5 else ""))
+    (tool, found), = matches
     with timer.span("refresh prices"):
         refresh_prices()
     with timer.span("price rows"):
@@ -2521,13 +2538,13 @@ def _session_costs(session: str, as_json: bool, timer: DebugTimer) -> int:
                       "ORDER BY timestamp, message_id").fetchall()
     responses = [dict(zip(SESSION_COST_COLUMNS, row)) for row in rows]
     if as_json:
-        print(json.dumps({"session": Path(paths[0]).stem, "pricing_basis": pricing_basis(),
-                          "transcripts": paths, "responses": responses}, indent=2))
+        print(json.dumps({"session": found, "tool": tool, "pricing_basis": pricing_basis(),
+                          "responses": responses}, indent=2))
         return 0
     cost = sum(item["api_cost_usd"] or 0 for item in responses)
     tokens = sum(item["total_tokens"] or 0 for item in responses)
     unpriced = sum(1 for item in responses if item["api_cost_usd"] is None)
-    print(f"{Path(paths[0]).stem}: {len(responses)} responses, {tokens:,} tokens, "
+    print(f"{tool} {found}: {len(responses)} responses, {tokens:,} tokens, "
           f"${cost:,.2f} at API rates" + (f", {unpriced} unpriced" if unpriced else ""))
     print(f"pricing: {pricing_basis()}, rates in effect when each request ran")
     return 0
@@ -2859,9 +2876,9 @@ def main(argv: list[str] | None = None):
     command("quota-history", "Audit API-equivalent usage across every observed fixed quota "
                              "period", quota_db, as_json)
     command("record-quota", "Fetch and retain current provider quota percentages", quota_db)
-    session = command("session-costs", "Each response of one Claude Code session with its "
-                                       "API-equivalent cost, read from that session's "
-                                       "transcripts alone", as_json)
+    session = command("session-costs", "Each response of one session, in any harness, with "
+                                       "its API-equivalent cost, read from that session's "
+                                       "files alone", as_json)
     session.add_argument("session", help="The session id, or a unique prefix of it")
 
     argv = sys.argv[1:] if argv is None else list(argv)
