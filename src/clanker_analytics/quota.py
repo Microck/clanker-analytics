@@ -659,10 +659,77 @@ def _token_window(db: Any, tool: str, start: datetime, end: datetime,
     }
 
 
+# A completed period counts toward a window's price once this many points were used, below
+# which quantized percentages and small samples make the ratio noise.
+HISTORY_MIN_USED_PCT = 5.0
+
+
+def history_calibration(periods: list[dict[str, Any]], bucket: dict[str, Any],
+                        now: datetime) -> dict[str, Any]:
+    """A window's API-equivalent price per quota point from its completed periods.
+
+    The price is the local cost of every measured period over the points they used, which
+    weights each period by its use. A period that used points with no local cost at all
+    was used where the local logs cannot see, such as another machine, and is counted
+    apart instead of pulling the price to zero. A period on a different plan is left out,
+    since a plan sets how much use a point is.
+    """
+    tool = PROVIDER_TO_TOOL.get(bucket["provider"])
+    account = bucket["account_key"]
+    minutes = (bucket["window_seconds"] or 0) // 60
+
+    def window_of(period: dict[str, Any]) -> str:
+        limit = period["limit_id"]
+        return limit[len(account) + 1:] if limit.startswith(f"{account}:") else limit
+
+    # Codex's own logs carry its weekly history, as one account-wide limit named codex.
+    names = {bucket["bucket_id"], *(["codex"] if tool == "Codex" and not bucket["scope_id"] else [])}
+    matching = [period for period in periods
+                if period["tool"] == tool and period["window_minutes"] == minutes
+                and window_of(period) in names]
+    own = [period for period in matching if period.get("account") == account]
+    candidates = own or [period for period in matching if period.get("account") in (None, "default")]
+    def plan_name(value: str | None) -> str | None:
+        """The plan as a priced plan id, or None when unknown or ambiguous, such as a
+        Google AI Ultra reading from before the tier id was recorded."""
+        plan = normalize_plan(value) if value else None
+        return plan if plan and plan_price(PLAN_TOOLS.get(tool, tool), plan) else None
+
+    plan = plan_name(bucket.get("plan"))
+    if plan:
+        candidates = [period for period in candidates
+                      if plan_name(period.get("plan")) in (None, plan)]
+    completed = [period for period in candidates
+                 if (_parse_time(period["resets_at"]) or now) <= now
+                 and period["used_pct"] >= HISTORY_MIN_USED_PCT]
+    measured = [period for period in completed if period["api_equivalent_cost_usd"] > 0]
+    unaccounted = [period for period in completed if period["api_equivalent_cost_usd"] <= 0]
+    cost = sum(period["api_equivalent_cost_usd"] for period in measured)
+    points = sum(period["used_pct"] for period in measured)
+    return {
+        "method": "completed_periods_local_cost_divided_by_used_pct",
+        "api_usd_per_quota_percentage_point": cost / points if points else None,
+        "periods": len(measured),
+        "api_usd": cost,
+        "quota_pp": points,
+        "first_resets_at": min((p["resets_at"] for p in measured), default=None),
+        "last_resets_at": max((p["resets_at"] for p in measured), default=None),
+        "unaccounted_periods": len(unaccounted),
+        "unaccounted_pp": sum(period["used_pct"] for period in unaccounted),
+        "min_used_pct": HISTORY_MIN_USED_PCT,
+        "plan": plan,
+    }
+
+
 def build_report(connection: sqlite3.Connection, token_db: Any, lookbacks: Iterable[int],
                  cost_expression: str, include_inactive: bool = False,
                  pricing_basis: str = "") -> dict[str, Any]:
     assign_claude_accounts(connection)
+    # Quota history needs the cache's quota columns; a table without them has no history.
+    columns = {row[0] for row in token_db.execute("DESCRIBE tokens").fetchall()}
+    history = (build_quota_history(token_db, cost_expression, pricing_basis, connection)["periods"]
+               if {"source_kind", "quota_used_pct", "pricing"} <= columns else [])
+    report_time = datetime.now(timezone.utc)
     requested = sorted(set(lookbacks))
     buckets = []
     inactive_buckets = []
@@ -698,6 +765,8 @@ def build_report(connection: sqlite3.Connection, token_db: Any, lookbacks: Itera
                     "account_label": labels.get((current["provider"], current["account_key"])),
                     "last_used_at": used.get((current["provider"], current["account_key"])),
                     "window_pace": pace,
+                    "token_calibration": {
+                        "history": history_calibration(history, current, report_time)},
                 })
             continue
         tool = PROVIDER_TO_TOOL.get(current["provider"])
@@ -873,6 +942,11 @@ def build_report(connection: sqlite3.Connection, token_db: Any, lookbacks: Itera
                 "window_start": _time_text(window_start) if window_start else None,
                 "local_period_usage": period_tokens,
                 "coverage": "local_only",
+                # The window's use so far shows in its quota but in no local log.
+                "current_unaccounted": bool(
+                    current["used_pct"] > 0 and period_tokens is not None
+                    and period_tokens["api_cost_usd"] <= 0),
+                "history": history_calibration(history, current, report_time),
             },
             "lookbacks": intervals,
         }

@@ -478,6 +478,44 @@ class TestQuota(Case):
         with connect(tmp_path / "quota.sqlite3") as quota_db:
             assert quota.account_labels(quota_db) == {("anthropic", "account-second"): "second"}
 
+    def test_window_price_comes_from_its_completed_periods(self):
+        def period(resets_at, used, cost, account="acct", limit="acct:Gemini:5h", plan="ultra_100",
+                   tool="Agy", minutes=300):
+            return {"tool": tool, "limit_id": limit, "window_minutes": minutes, "account": account,
+                    "plan": plan, "resets_at": resets_at, "used_pct": used,
+                    "api_equivalent_cost_usd": cost}
+
+        bucket = {"provider": "antigravity", "account_key": "acct", "bucket_id": "Gemini:5h",
+                  "scope_id": "Gemini", "window_seconds": 18000, "plan": "ultra_100"}
+        periods = [
+            period("2026-10-30T10:00:00Z", 40, 12.0),
+            # A reading from before the tier id was recorded names the same plan ambiguously.
+            period("2026-10-30T15:00:00Z", 60, 18.0, plan="Google AI Ultra"),
+            # Used where the local logs cannot see.
+            period("2026-10-30T20:00:00Z", 30, 0.0),
+            # Too little use to price, another account, another window and a running period.
+            period("2026-10-31T01:00:00Z", 2, 5.0),
+            period("2026-10-30T10:00:00Z", 50, 99.0, account="other", limit="other:Gemini:5h"),
+            period("2026-10-30T10:00:00Z", 50, 99.0, limit="acct:Gemini:1w", minutes=10080),
+            period("2026-11-01T22:00:00Z", 50, 99.0),
+        ]
+        now = datetime(2026, 11, 1, 20, tzinfo=timezone.utc)
+
+        price = quota.history_calibration(periods, bucket, now)
+
+        assert price["api_usd_per_quota_percentage_point"] == approx(30 / 100)
+        assert (price["periods"], price["quota_pp"], price["unaccounted_periods"],
+                price["unaccounted_pp"]) == (2, 100, 1, 30)
+
+        # A period on another priced plan buys a different amount of use per point.
+        codex = {"provider": "openai", "account_key": "acct", "bucket_id": "1w", "scope_id": "",
+                 "window_seconds": 604800, "plan": "plus"}
+        weeks = [period("2026-10-01T00:00:00Z", 50, 1000.0, account="default", limit="codex",
+                        plan="pro", tool="Codex", minutes=10080),
+                 period("2026-10-20T00:00:00Z", 50, 100.0, account="default", limit="codex",
+                        plan="plus", tool="Codex", minutes=10080)]
+        assert quota.history_calibration(weeks, codex, now)["api_usd_per_quota_percentage_point"] == approx(2)
+
     def test_snapshot_insert_is_idempotent(self):
         tmp_path = self.tmp_path
         with connect(tmp_path / "quota.sqlite3") as db:
