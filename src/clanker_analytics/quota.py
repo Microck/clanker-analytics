@@ -718,7 +718,83 @@ def history_calibration(periods: list[dict[str, Any]], bucket: dict[str, Any],
         "unaccounted_pp": sum(period["used_pct"] for period in unaccounted),
         "min_used_pct": HISTORY_MIN_USED_PCT,
         "plan": plan,
+        # Set when the price comes from a sibling window instead of this one's periods.
+        "derived": None,
     }
+
+
+# Consecutive snapshots further apart than this are not paired: a window could have reset
+# and refilled between them unseen.
+SIBLING_GAP_SECONDS = 900
+
+
+def sibling_calibration(connection: sqlite3.Connection, bucket: dict[str, Any],
+                        sibling: dict[str, Any], sibling_price: float) -> dict[str, Any] | None:
+    """A window's price derived from a sibling window of the same account and models.
+
+    Both windows count the same use, so over the snapshot intervals in which neither reset,
+    the points each rose by give how many sibling points one of this window's points is
+    worth. Intervals on another plan are left out. Returns None without enough joint rise.
+    """
+    rows = connection.execute("""
+        SELECT a.effective_at, a.used_pct, a.resets_at, b.used_pct, b.resets_at, a.plan
+        FROM quota_samples a JOIN quota_samples b
+          ON b.provider = a.provider AND b.account_key = a.account_key
+         AND b.effective_at = a.effective_at
+        WHERE a.provider = ? AND a.account_key = ? AND a.bucket_id = ? AND b.bucket_id = ?
+          AND a.scope_id = ? AND b.scope_id = ?
+        ORDER BY a.effective_at
+    """, (bucket["provider"], bucket["account_key"], bucket["bucket_id"], sibling["bucket_id"],
+          bucket["scope_id"], sibling["scope_id"])).fetchall()
+    plan = bucket.get("plan")
+    own = other = 0.0
+    intervals = 0
+    for earlier, later in zip(rows, rows[1:]):
+        if plan and later[5] not in (None, plan):
+            continue
+        gap = (_parse_time(later[0]) - _parse_time(earlier[0])).total_seconds()
+        same_windows = all(
+            abs((_parse_time(later[index]) - _parse_time(earlier[index])).total_seconds()) <= 60
+            for index in (2, 4) if earlier[index] and later[index])
+        rise, sibling_rise = later[1] - earlier[1], later[3] - earlier[3]
+        if (gap <= SIBLING_GAP_SECONDS and same_windows and rise >= 0 and sibling_rise >= 0
+                and rise + sibling_rise > 0):
+            own += rise
+            other += sibling_rise
+            intervals += 1
+    if own < HISTORY_MIN_USED_PCT or other <= 0:
+        return None
+    return {
+        "method": "derived_from_sibling_window",
+        "api_usd_per_quota_percentage_point": sibling_price * other / own,
+        "sibling_bucket_id": sibling["bucket_id"],
+        "sibling_api_usd_per_quota_percentage_point": sibling_price,
+        "sibling_pp_per_pp": other / own,
+        "intervals": intervals,
+        "quota_pp": own,
+        "sibling_quota_pp": other,
+    }
+
+
+def _derive_missing_prices(connection: sqlite3.Connection,
+                           buckets: list[dict[str, Any]]) -> None:
+    """Give each window without a price from its own history one derived from a priced
+    sibling window of the same account and models, the one they rose together most with."""
+    for bucket in buckets:
+        history = bucket["token_calibration"]["history"]
+        if history["api_usd_per_quota_percentage_point"] is not None:
+            continue
+        derived = [found for sibling in buckets
+                   if sibling is not bucket and sibling["provider"] == bucket["provider"]
+                   and sibling["account_key"] == bucket["account_key"]
+                   and sibling["scope_id"] == bucket["scope_id"]
+                   and (price := sibling["token_calibration"]["history"]
+                        ["api_usd_per_quota_percentage_point"]) is not None
+                   and (found := sibling_calibration(connection, bucket, sibling, price))]
+        if derived:
+            best = max(derived, key=lambda item: item["quota_pp"])
+            history.update(api_usd_per_quota_percentage_point=best["api_usd_per_quota_percentage_point"],
+                           derived=best)
 
 
 def build_report(connection: sqlite3.Connection, token_db: Any, lookbacks: Iterable[int],
@@ -730,6 +806,7 @@ def build_report(connection: sqlite3.Connection, token_db: Any, lookbacks: Itera
     history = (build_quota_history(token_db, cost_expression, pricing_basis, connection)["periods"]
                if {"source_kind", "quota_used_pct", "pricing"} <= columns else [])
     report_time = datetime.now(timezone.utc)
+    priced: list[dict[str, Any]] = []
     requested = sorted(set(lookbacks))
     buckets = []
     inactive_buckets = []
@@ -761,13 +838,15 @@ def build_report(connection: sqlite3.Connection, token_db: Any, lookbacks: Itera
                 inactive_buckets.append({
                     **{key: current[key] for key in (
                         "provider", "account_key", "bucket_id", "bucket_label", "scope_type",
-                        "scope_id", "window_kind", "window_seconds", "used_pct", "resets_at")},
+                        "scope_id", "window_kind", "window_seconds", "used_pct", "resets_at",
+                        "plan")},
                     "account_label": labels.get((current["provider"], current["account_key"])),
                     "last_used_at": used.get((current["provider"], current["account_key"])),
                     "window_pace": pace,
                     "token_calibration": {
                         "history": history_calibration(history, current, report_time)},
                 })
+                priced.append(inactive_buckets[-1])
             continue
         tool = PROVIDER_TO_TOOL.get(current["provider"])
         model_patterns = _model_patterns(current)
@@ -926,6 +1005,7 @@ def build_report(connection: sqlite3.Connection, token_db: Any, lookbacks: Itera
             "scope_id": current["scope_id"],
             "window_kind": current["window_kind"],
             "window_seconds": current["window_seconds"],
+            "plan": current["plan"],
             "window_pace": window_pace(connection, current),
             "effective_at": current["effective_at"],
             "used_pct": current["used_pct"],
@@ -962,12 +1042,14 @@ def build_report(connection: sqlite3.Connection, token_db: Any, lookbacks: Itera
             )
             if completed else False
         )
+        priced.append(bucket)
         if include_inactive or active:
             buckets.append(bucket)
         else:
             hidden_bucket_count += 1
             if not completed:
                 collecting_bucket_count += 1
+    _derive_missing_prices(connection, priced)
     return {
         "schema_version": 1,
         "generated_at": _time_text(datetime.now(timezone.utc)),

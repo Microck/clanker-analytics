@@ -516,6 +516,31 @@ class TestQuota(Case):
                         plan="plus", tool="Codex", minutes=10080)]
         assert quota.history_calibration(weeks, codex, now)["api_usd_per_quota_percentage_point"] == approx(2)
 
+    def test_window_without_periods_is_priced_from_a_sibling_window(self):
+        def snapshot(minute, short, week, plan="plus", short_reset="2026-11-01T05:00:00Z"):
+            when = f"2026-11-01T{minute // 60:02d}:{minute % 60:02d}:00Z"
+            return _usage_samples("openai", when, [
+                ("5-hour", 18000, None, short, short_reset),
+                ("weekly", 604800, None, week, "2026-11-04T00:00:00Z")], "acct", plan)
+
+        with connect(self.tmp_path / "quota.sqlite3") as db:
+            insert_samples(db, [
+                # The 5-hour window rises 30 points while the weekly one rises 6.
+                *snapshot(0, 0, 10), *snapshot(5, 10, 12), *snapshot(10, 30, 16),
+                # A reset of the 5-hour window, and a reading on another plan, are not paired.
+                *snapshot(15, 2, 16, short_reset="2026-11-01T10:00:00Z"),
+                *snapshot(20, 50, 30, plan="pro", short_reset="2026-11-01T10:00:00Z"),
+            ])
+            bucket = {"provider": "openai", "account_key": "acct", "bucket_id": "5h",
+                      "scope_id": "", "plan": "plus"}
+            sibling = {"provider": "openai", "account_key": "acct", "bucket_id": "1w", "scope_id": ""}
+
+            derived = quota.sibling_calibration(db, bucket, sibling, 3.0)
+
+        assert derived["sibling_pp_per_pp"] == approx(6 / 30)
+        assert derived["api_usd_per_quota_percentage_point"] == approx(3.0 * 6 / 30)
+        assert (derived["intervals"], derived["quota_pp"], derived["sibling_quota_pp"]) == (2, 30, 6)
+
     def test_snapshot_insert_is_idempotent(self):
         tmp_path = self.tmp_path
         with connect(tmp_path / "quota.sqlite3") as db:
