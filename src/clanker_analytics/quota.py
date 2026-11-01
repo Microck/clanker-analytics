@@ -15,6 +15,7 @@ import sys
 from typing import Any, Iterable
 
 from clanker_analytics.pricing import normalize_plan, plan_price
+from clanker_analytics.rows import insert_rows
 
 
 DEFAULT_LOOKBACKS = (3600, 6 * 3600, 24 * 3600)
@@ -1028,9 +1029,7 @@ def build_quota_history(token_db: Any, cost_expression: str, pricing_basis: str,
         assign_claude_accounts(quota_connection)
         recorded = _recorder_observations(quota_connection)
         if recorded:
-            token_db.executemany(
-                "INSERT INTO quota_observations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", recorded
-            )
+            insert_rows(token_db, "quota_observations", recorded)
     rows = token_db.execute(f"""
         WITH observations AS (
             SELECT

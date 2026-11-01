@@ -23,6 +23,7 @@ from typing import Iterable
 
 import duckdb
 
+from clanker_analytics.rows import insert_rows
 from clanker_analytics.pricing import (
     cache_pricing_key, configured_plans, normalize_plan, plan_choice, plan_price, price_tokens,
     pricing_basis,
@@ -762,11 +763,11 @@ def _load_agy_models(db: duckdb.DuckDBPyConnection, transcript_paths: list[str])
             rows.append((session, model))
     db.execute(f"CREATE OR REPLACE TEMP TABLE {AGY_MODELS_TABLE} (session VARCHAR, model VARCHAR)")
     if rows:
-        db.executemany(f"INSERT INTO {AGY_MODELS_TABLE} VALUES (?, ?)", rows)
+        insert_rows(db, AGY_MODELS_TABLE, rows)
     db.execute(f"""CREATE OR REPLACE TEMP TABLE {AGY_USAGE_TABLE} (session VARCHAR,
                    step_index BIGINT, input BIGINT, cache_read BIGINT, output BIGINT)""")
     if usage_rows:
-        db.executemany(f"INSERT INTO {AGY_USAGE_TABLE} VALUES (?, ?, ?, ?, ?)", usage_rows)
+        insert_rows(db, AGY_USAGE_TABLE, usage_rows)
 
 
 def _agy_sql(source_expr: str, metadata_expr: str | None = None,
@@ -1185,9 +1186,7 @@ def _load_zcode_usage(db: duckdb.DuckDBPyConnection, paths: list[str]) -> None:
             print(f"  warning: could not read Zcode usage from {path}: {error}", file=sys.stderr)
     db.execute(f"CREATE OR REPLACE TEMP TABLE {ZCODE_USAGE_TABLE} ({ZCODE_USAGE_COLUMNS})")
     if rows:
-        db.executemany(
-            f"INSERT INTO {ZCODE_USAGE_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
-        )
+        insert_rows(db, ZCODE_USAGE_TABLE, rows)
 
 
 def _muse_parent_logs(paths: list[str]) -> list[str]:
@@ -2289,7 +2288,7 @@ def _append_source_files(db: duckdb.DuckDBPyConnection, files: dict[str, SourceS
         _insert_source_files(db, files)
         if real_paths:
             db.execute("CREATE OR REPLACE TEMP TABLE copied_logs (copy VARCHAR, path VARCHAR)")
-            db.executemany("INSERT INTO copied_logs VALUES (?, ?)", list(real_paths.items()))
+            insert_rows(db, "copied_logs", real_paths.items())
             db.execute("""
                 UPDATE tokens SET source_file = copied_logs.path FROM copied_logs
                 WHERE tokens.source_file = copied_logs.copy
