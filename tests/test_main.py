@@ -801,6 +801,48 @@ class TestSourceLoaders(Case):
                 # A subagent log read alone still takes the session's project.
                 assert rows == (expected if len(read) == 2 else expected[1:2])
 
+    def test_opencode_counts_each_assistant_message_once(self):
+        database = self.tmp_path / "opencode.db"
+        source = sqlite3.connect(database)
+        # The tables and JSON as OpenCode writes them.
+        source.executescript("""
+            CREATE TABLE session (id text PRIMARY KEY, project_id text NOT NULL, parent_id text,
+                directory text NOT NULL, time_created integer NOT NULL);
+            CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL,
+                time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);
+        """)
+        source.executemany("INSERT INTO session VALUES (?, 'p', ?, ?, 0)", [
+            ("ses_main", None, "/code/w3sim-r5d"), ("ses_child", "ses_main", "/code/w3sim-r5d")])
+        def assistant(model, tokens, created):
+            return json.dumps({"role": "assistant", "path": {"cwd": "/code/w3sim-r5d/src",
+                               "root": "/code/w3sim-r5d"}, "cost": 0.038, "tokens": tokens,
+                               "modelID": model, "providerID": "opencode-go",
+                               "time": {"created": created, "completed": created + 1000}})
+        source.executemany("INSERT INTO message VALUES (?, ?, 0, 0, ?)", [
+            ("msg_1", "ses_main", assistant("kimi-k3.1-pro", {"total": 172485, "input": 712,
+                "output": 141, "reasoning": 112, "cache": {"write": 0, "read": 171520}},
+                1793717239181)),
+            ("msg_2", "ses_child", assistant("glm-5.3-flash", {"total": 30, "input": 10,
+                "output": 20, "reasoning": 0, "cache": {"write": 0, "read": 0}}, 1793717240000)),
+            ("msg_3", "ses_main", json.dumps({"role": "user", "time": {"created": 1793717230000}})),
+        ])
+        source.commit()
+        source.close()
+
+        db = duckdb.connect()
+        main_mod._load_opencode_usage(db, [database.as_posix()])
+        relation = db.sql(main_mod._opencode_sql(""))
+        columns = [item[0] for item in relation.description]
+        rows = sorted((dict(zip(columns, row)) for row in relation.fetchall()),
+                      key=lambda row: row["message_id"])
+
+        assert [(row["project"], row["model"], row["execution_type"], row["input_tokens"],
+                 row["output_tokens"], row["cache_read_tokens"], row["total_tokens"])
+                for row in rows] == [
+            ("w3sim-r5d", "opencode-go/kimi-k3.1-pro", "interactive", 712, 253, 171520, 172485),
+            ("w3sim-r5d", "opencode-go/glm-5.3-flash", "subagent", 10, 20, 0, 30)]
+        assert rows[0]["timestamp"] == "2026-11-03T14:47:20.181Z"
+
     def test_gemini_timestamp_schema_shape_is_cast_before_slicing(self):
         tmp_path = self.tmp_path
         chat = tmp_path / "tmp" / ("a" * 64) / "chats" / "session.json"

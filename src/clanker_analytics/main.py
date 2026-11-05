@@ -88,6 +88,7 @@ ZCODE_TOOL = "Zcode"
 ZCODE_USAGE_TABLE = "zcode_model_usage"
 
 MUSE_TOOL = "Muse"
+OPENCODE_TOOL = "OpenCode"
 
 
 def _gemini_home() -> Path:
@@ -134,6 +135,7 @@ def _home_trees() -> list[tuple[str, Path, str]]:
         (ZCODE_TOOL, Path(HOME) / ".zcode" / "cli" / "db", "db.sqlite"),
         # A session's log and each subagent's, under sessions/YYYY/MM/DD/<session>/.
         (MUSE_TOOL, data / "muse" / "sessions", "session.jsonl"),
+        (OPENCODE_TOOL, data / "opencode", "opencode.db"),
     ]
 
 
@@ -1167,6 +1169,95 @@ ZCODE_USAGE_QUERY = """
     WHERE m.input_tokens + m.output_tokens > 0 OR m.error_type = 'rate_limited'
 """
 
+OPENCODE_USAGE_TABLE = "opencode_messages"
+OPENCODE_USAGE_COLUMNS = """
+    source_file VARCHAR,
+    message_id VARCHAR,
+    session_id VARCHAR,
+    parent_session_id VARCHAR,
+    directory VARCHAR,
+    model VARCHAR,
+    created_at BIGINT,
+    input_tokens BIGINT,
+    output_tokens BIGINT,
+    reasoning_tokens BIGINT,
+    cache_read_tokens BIGINT,
+    cache_write_tokens BIGINT
+"""
+
+# Each assistant message records the usage of the model call that wrote it; input is
+# uncached, and reasoning is counted apart from output.
+OPENCODE_USAGE_QUERY = """
+    SELECT m.id, m.session_id, s.parent_id,
+           coalesce(json_extract(m.data, '$.path.root'), s.directory),
+           json_extract(m.data, '$.providerID') || '/' || json_extract(m.data, '$.modelID'),
+           coalesce(json_extract(m.data, '$.time.completed'), json_extract(m.data, '$.time.created'),
+                    m.time_created),
+           coalesce(json_extract(m.data, '$.tokens.input'), 0),
+           coalesce(json_extract(m.data, '$.tokens.output'), 0),
+           coalesce(json_extract(m.data, '$.tokens.reasoning'), 0),
+           coalesce(json_extract(m.data, '$.tokens.cache.read'), 0),
+           coalesce(json_extract(m.data, '$.tokens.cache.write'), 0)
+    FROM message m LEFT JOIN session s ON s.id = m.session_id
+    WHERE json_extract(m.data, '$.role') = 'assistant'
+      AND json_extract(m.data, '$.tokens') IS NOT NULL
+"""
+
+
+def _load_opencode_usage(db: duckdb.DuckDBPyConnection, paths: list[str]) -> None:
+    """Copy each OpenCode model call's usage from its SQLite database into DuckDB."""
+    rows = []
+    for path in paths:
+        try:
+            source = sqlite3.connect(f"{Path(path).as_uri()}?mode=ro", uri=True)
+            try:
+                rows.extend((path, *row) for row in source.execute(OPENCODE_USAGE_QUERY))
+            finally:
+                source.close()
+        except sqlite3.Error as error:
+            print(f"  warning: could not read OpenCode usage from {path}: {error}", file=sys.stderr)
+    db.execute(f"CREATE OR REPLACE TEMP TABLE {OPENCODE_USAGE_TABLE} ({OPENCODE_USAGE_COLUMNS})")
+    if rows:
+        insert_rows(db, OPENCODE_USAGE_TABLE, rows)
+
+
+def _opencode_sql(source_expr: str) -> str:
+    """Normalize the model calls _load_opencode_usage copied. Models are named
+    provider/model, as AOP names OpenCode's."""
+    return f"""
+SELECT
+    '{OPENCODE_TOOL}' as tool,
+    lower(regexp_extract(replace(directory, '\\', '/'), '([^/]+)/?$', 1)) as project,
+    session_id as session,
+    strftime(epoch_ms(created_at), '%Y-%m-%d') as date,
+    model,
+    input_tokens::INT as input_tokens,
+    (output_tokens + reasoning_tokens)::INT as output_tokens,
+    cache_write_tokens::INT as cache_write_tokens,
+    cache_read_tokens::INT as cache_read_tokens,
+    (input_tokens + output_tokens + reasoning_tokens + cache_read_tokens
+      + cache_write_tokens)::BIGINT as total_tokens,
+    CASE WHEN parent_session_id IS NOT NULL THEN 'subagent' ELSE 'interactive' END
+        as execution_type,
+    replace(directory, '\\', '/') as project_path,
+    'exact' as token_count_type,
+    1 as turn_count,
+    NULL::BIGINT as retained_tokens,
+    'native' as source_kind,
+    NULL::DOUBLE as cost_usd,
+    source_file,
+    strftime(epoch_ms(created_at), '%Y-%m-%dT%H:%M:%S.%gZ') as timestamp,
+    '' as rate_mode,
+    NULL::DOUBLE as quota_used_pct,
+    NULL::BIGINT as quota_resets_at,
+    NULL::INTEGER as quota_window_minutes,
+    NULL::VARCHAR as quota_limit_id,
+    message_id
+FROM {OPENCODE_USAGE_TABLE}
+WHERE input_tokens + output_tokens + reasoning_tokens + cache_read_tokens + cache_write_tokens > 0
+"""
+
+
 # Z.ai reports quota resets in China Standard Time: the reset in each observed limit
 # message is exactly one window after the first request that opened that window.
 ZAI_LIMIT_MESSAGE_UTC_OFFSET_HOURS = 8
@@ -1371,6 +1462,7 @@ SOURCES = {
     "aop": (AOP_RESULT_TOOL, _aop_sql),
     "zcode": (ZCODE_TOOL, _zcode_sql),
     "muse": (MUSE_TOOL, _muse_sql),
+    "opencode": (OPENCODE_TOOL, _opencode_sql),
 }
 
 # API-equivalent cost of each row, priced by model-prices when the cache is built. Rows
@@ -1803,7 +1895,7 @@ def scan_source_files() -> tuple[dict[str, SourceSnapshot], int, float]:
                         and not path.name.startswith("agent-")):
                     continue
                 stats = [path.stat()]
-                if tool == ZCODE_TOOL:
+                if tool in (ZCODE_TOOL, OPENCODE_TOOL):
                     # SQLite commits land in the write-ahead log before checkpointing.
                     wal = path.with_name(path.name + "-wal")
                     if wal.exists():
@@ -1951,6 +2043,8 @@ def _build_source_sql(db: duckdb.DuckDBPyConnection,
         if paths:
             if tool_name == ZCODE_TOOL:
                 _load_zcode_usage(db, paths)
+            if tool_name == OPENCODE_TOOL:
+                _load_opencode_usage(db, paths)
             if tool_name == MUSE_TOOL:
                 # A subagent's log names no workspace; its session's log does, so that
                 # is read alongside without adding its rows.
@@ -2491,6 +2585,7 @@ def _session_sources(session: str) -> dict[str, SourceSnapshot]:
         "Agy": [f"{prefix}*/.system_generated/logs/transcript_full.jsonl"],
         MUSE_TOOL: [f"*/*/*/{prefix}*/session.jsonl", f"*/*/*/{prefix}*/subagent/*/session.jsonl"],
         ZCODE_TOOL: ["db.sqlite"],
+        OPENCODE_TOOL: ["opencode.db"],
     }
     roots = {(tool, root) for tool, root, _ in _iter_source_trees() if tool in patterns}
     found: dict[str, SourceSnapshot] = {}

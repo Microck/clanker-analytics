@@ -44,7 +44,7 @@ name = "OpenCode"
 home = "${XDG_DATA_HOME:-~/.local/share}/opencode"
 sessions = ["opencode.db"]
 format = "SQLite: session, message and part tables with JSON data"
-readers = ["sch", "wakterm"]
+readers = ["sch", "clanker-analytics", "wakterm"]
 
 [zcode]
 name = "Zcode"
