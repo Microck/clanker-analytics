@@ -1,16 +1,16 @@
 [project]
 name = "clanker-analytics"
-version = "0.2.4"
+version = "0.5.4"
 description = "AI coding tool token analytics powered by DuckDB"
 readme = "README.md"
+license = "MIT AND OFL-1.1 AND CC-BY-4.0"
+license-files = ["LICENSE", "src/clanker_analytics/OFL-ClankerMono.txt", "src/clanker_analytics/emoji/LICENSE-CC-BY-4.0.txt"]
 requires-python = ">=3.13"
 dependencies = [
     "duckdb>=1.5.0",
     "matplotlib>=3.9",
-    "ccusage>=0.1.5",
-    "codex-cli-usage>=0.1.5",
-    "gemini-cli-usage>=0.1.5",
-    "opencode-usage>=0.2.4",
+    "clanker-usage>=0.4.0",
+    "model-prices>=0.0.5",
 ]
 
 [project.urls]
@@ -20,12 +20,12 @@ Source = "https://github.com/wakamex/clanker-analytics"
 [project.scripts]
 clanker-analytics = "clanker_analytics.main:main"
 
-[dependency-groups]
-dev = ["pytest"]
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/README.md", "/LICENSE"]
+
 [tool.hatch.build.targets.wheel]
-artifacts = ["src/clanker_analytics/*.ttf", "src/clanker_analytics/emoji/*.png"]
+artifacts = ["src/clanker_analytics/*.ttf", "src/clanker_analytics/OFL-ClankerMono.txt", "src/clanker_analytics/emoji/*.png", "src/clanker_analytics/emoji/LICENSE-CC-BY-4.0.txt"]

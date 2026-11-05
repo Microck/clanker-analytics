@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+from datetime import date, timedelta
 import urllib.parse
 from pathlib import Path
 
@@ -16,27 +17,37 @@ BG = "#040506"
 TEXT = "#d4c8b8"
 ACCENT = "#ff9800"
 DIM = "#6b5d4f"
+# Footer text: dimmer than TEXT but readable on BG (contrast about 6:1).
+MUTED = "#958676"
 LIGHT = "#e0e0e0"
 
 TOOL_COLORS = {
     "Claude Code": "#d97757",
     "Codex": "#10a37f",
     "Gemini": "#4285f4",
-    "OpenCode": "#9b59b6",
+    "Agy": "#a142f4",
+    "Cursor": "#7c5cff",
+    "Devin": "#7cae5f",
+    "DeepSeek Harness": "#4d6bfe",
+    "Grok": "#c0c0c0",
+    "Hermes": "#ff6b35",
+    "OpenCode": "#f0b429",
 }
+# Ranges longer than this many days draw one bar per week instead of per day.
+DAILY_BAR_DAYS = 62
+# Tools under 1% of the period's cost share one segment and one legend entry.
+OTHER = "Other"
+OTHER_COLOR = "#8a8a8a"
 
 from clanker_analytics.main import COST_PER_ROW as COST_SQL
 
-FONT_PATH = Path(__file__).parent / "D2CodingLigature.ttf"
+FONT_PATH = Path(__file__).parent / "ClankerMono.ttf"
 OUTPUT = Path.home() / ".cache" / "clanker-analytics" / "share.png"
 
 
 def _font(size: int, bold: bool = False) -> dict:
-    return {
-        "fontproperties": fm.FontProperties(
-            fname=FONT_PATH, size=size, weight="bold" if bold else "normal"
-        )
-    }
+    return {"fontproperties": fm.FontProperties(fname=FONT_PATH, size=size,
+                                                weight="bold" if bold else "normal")}
 
 
 def _fmt_cost(n: float) -> str:
@@ -64,32 +75,84 @@ def _fmt_tokens(n: int) -> str:
 
 def _short_date(d: str) -> str:
     """'2026-03-15' -> 'Mar 15'"""
-    months = [
-        "Jan",
-        "Feb",
-        "Mar",
-        "Apr",
-        "May",
-        "Jun",
-        "Jul",
-        "Aug",
-        "Sep",
-        "Oct",
-        "Nov",
-        "Dec",
-    ]
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     parts = d.split("-")
     return f"{months[int(parts[1]) - 1]} {int(parts[2])}"
 
 
-def generate(
-    db: duckdb.DuckDBPyConnection,
-    since_label: str | None,
-    plans: dict | None = None,
-    cost_mode: str = "auto",
-) -> Path:
-    """Generate share card PNG. Returns path to output file."""
-    plt.rcParams["text.parse_math"] = False
+def _color(tool: str) -> str:
+    return OTHER_COLOR if tool == OTHER else TOOL_COLORS.get(tool, "#c4862c")
+
+
+def _stack(ax, x, series: dict[str, np.ndarray], width: float,
+           partial: int | None = None, horizontal: bool = False,
+           labels: dict[int, str] | None = None) -> None:
+    """Stacked bars, first series at the bottom, with a background-colored gap between
+    segments so each tool's share stays legible. The bar at `partial`, a period still in
+    progress, is hatched, and `labels` maps bar indexes to text at their ends."""
+    bottoms = np.zeros(len(x))
+    plt.rcParams["hatch.color"] = BG
+    plt.rcParams["hatch.linewidth"] = 1.5
+    for t, vals in series.items():
+        draw = ax.barh if horizontal else ax.bar
+        bars = draw(x, vals, width, bottoms, color=_color(t), edgecolor=BG, linewidth=1)
+        if partial is not None:
+            bars[partial].set_hatch("///")
+        bottoms += vals
+    for i, text in (labels or {}).items():
+        point, offset = ((bottoms[i], x[i]), (4, 0)) if horizontal else ((x[i], bottoms[i]), (0, 3))
+        ax.annotate(text, point, xytext=offset, textcoords="offset points", color=TEXT,
+                    **_font(10), ha="left" if horizontal else "center",
+                    va="center" if horizontal else "bottom")
+    # Headroom above the tallest bar, which the stack's segment edges would otherwise
+    # pin to the plot's edge, and room for its label.
+    headroom = 1.05 if not labels else (1.15 if horizontal else 1.08)
+    (ax.set_xlim if horizontal else ax.set_ylim)(0, max(bottoms.max(), 1e-9) * headroom)
+
+
+def _plot_periods(ax, periods: list[date], step: int,
+                  series: dict[str, np.ndarray]) -> str | None:
+    """Cost as one stacked bar per day, or per week starting Monday when step is 7.
+
+    Up to two weeks of bars each show their total; more show only the tallest, since
+    labels on every bar would run together. Returns a note explaining the hatched bar of
+    a period still in progress when its own label does not."""
+    x = np.arange(len(periods))
+    today = date.today()
+    partial = len(periods) - 1 if periods[-1] + timedelta(step) > today else None
+    totals = sum(series.values())
+    shown = list(x) if len(periods) <= 14 else [int(np.argmax(totals))]
+    labels = {i: _fmt_cost(totals[i]) + (" so far" if i == partial else "") for i in shown}
+    _stack(ax, x, series, width=0.8, partial=partial, labels=labels)
+    if step == 7:
+        # A label at the first week of each month.
+        ticks = []
+        for i, d in enumerate(periods):
+            # Skip a month start too close to the previous label to fit beside it.
+            if (i == 0 or d.month != periods[i - 1].month) and (not ticks or i - ticks[-1] > 2):
+                ticks.append(i)
+        labels = [periods[i].strftime("%b '%y" if periods[i].month == 1 or i == ticks[0]
+                                      else "%b") for i in ticks]
+    else:
+        # A label for every day up to two weeks, then one each Monday.
+        ticks = (list(x) if len(periods) <= 14
+                 else [i for i, d in enumerate(periods) if d.weekday() == 0])
+        labels = [_short_date(periods[i].isoformat()) for i in ticks]
+        ax.set_xticks(x, minor=True)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(labels, rotation=0, ha="center", **_font(11))
+    ax.set_xlim(-0.6, len(periods) - 0.4)
+    if partial is not None and partial not in labels:
+        return f"hatched: {'today' if step == 1 else 'this week'} so far"
+    return None
+
+
+def generate(db: duckdb.DuckDBPyConnection, since_label: str | None,
+             plans: dict | None = None, cost_mode: str = "auto",
+             output: Path | None = None) -> Path:
+    """Generate share card PNG at `output`, by default OUTPUT. Returns its path."""
+    plt.rcParams['text.parse_math'] = False
 
     # Get totals
     totals = db.sql(f"""
@@ -97,10 +160,11 @@ def generate(
                (sum(total_tokens) - 0.9 * sum(cache_read_tokens))::BIGINT,
                count(DISTINCT tool)::INT,
                count(DISTINCT project)::INT,
-               sum({COST_SQL})
+               sum({COST_SQL}),
+               count(*) FILTER (WHERE token_count_type != 'exact') > 0
         FROM tokens
     """).fetchone()
-    total_tokens, billable_tokens, n_tools, n_projects, total_cost = totals
+    total_tokens, billable_tokens, n_tools, n_projects, total_cost, has_estimates = totals
     total_tokens = total_tokens or 0
     billable_tokens = billable_tokens or 0
     total_cost = total_cost or 0
@@ -110,11 +174,18 @@ def generate(
 
     # Get api cost per tool
     tool_costs = db.sql(f"""
-        SELECT tool, sum({COST_SQL}) as cost
+        SELECT tool, sum({COST_SQL}) as cost,
+               count(*) FILTER (WHERE token_count_type != 'exact') > 0 as estimated
         FROM tokens GROUP BY tool ORDER BY cost DESC
     """).fetchall()
 
-    # Get chart data — use per-project bars for short ranges, daily area for longer
+    # Largest tools first, at the bottom of each stack; the rest fold into Other.
+    shown = [item for item in tool_costs if item[1] >= 0.01 * total_cost] or tool_costs[:1]
+    folded = tool_costs[len(shown):]
+    order = [t for t, _, _ in shown] + ([OTHER] if folded else [])
+    group = {t: (t if t in order else OTHER) for t, _, _ in tool_costs}
+
+    # Get chart data — use per-project bars for short ranges, daily bars for longer
     n_dates = db.sql("SELECT count(DISTINCT date) FROM tokens").fetchone()[0]
     use_bars = n_dates <= 3
 
@@ -130,88 +201,62 @@ def generate(
             ORDER BY sum({COST_SQL}) DESC
         """).fetchall()
         projects = list(dict.fromkeys(p for p, _, _ in chart_data))
-        tools = sorted(set(t for _, t, _ in chart_data))
-        tool_proj = {t: {} for t in tools}
+        tool_proj = {t: {} for t in order}
         for p, t, cost in chart_data:
-            tool_proj[t][p] = cost
+            tool_proj[group[t]][p] = tool_proj[group[t]].get(p, 0) + cost
     else:
         daily = db.sql(f"""
             SELECT date, tool, sum({COST_SQL}) as cost
             FROM tokens GROUP BY date, tool ORDER BY date
         """).fetchall()
-        tools = sorted(set(t for _, t, _ in daily))
-        dates = sorted(set(d for d, _, _ in daily))
-        tool_data = {t: {} for t in tools}
+        # Every day or week from the first to the last, so idle ones show as gaps.
+        first, last = (date.fromisoformat(d) for d in (daily[0][0], daily[-1][0]))
+        step = 1 if (last - first).days < DAILY_BAR_DAYS else 7
+        first -= timedelta((first.weekday() if step == 7 else 0))
+        periods = [first + timedelta(n) for n in range(0, (last - first).days + 1, step)]
+        series = {t: np.zeros(len(periods)) for t in order}
         for d, t, cost in daily:
-            tool_data[t][d] = cost
+            series[group[t]][(date.fromisoformat(d) - first).days // step] += cost
 
     # Build figure
     fig, ax = plt.subplots(figsize=(12, 6.75), dpi=100)
     fig.set_facecolor(BG)
     ax.set_facecolor(BG)
 
+    note = None
     if use_bars and projects:
-        x = np.arange(len(projects))
-        bar_width = 0.6
-        bottoms = np.zeros(len(projects))
-        for t in tools:
-            vals = np.array([tool_proj[t].get(p, 0) for p in projects], dtype=float)
-            color = TOOL_COLORS.get(t, "#c4862c")
-            ax.bar(x, vals, bar_width, bottom=bottoms, color=color, alpha=0.8)
-            bottoms += vals
-        ax.set_xticks(x)
-        ax.set_xticklabels(projects, rotation=0, ha="center", **_font(11))
-    elif not use_bars and dates:
-        x = np.arange(len(dates))
-        bottoms = np.zeros(len(dates))
-        for t in tools:
-            vals = np.array([tool_data[t].get(d, 0) for d in dates], dtype=float)
-            color = TOOL_COLORS.get(t, "#c4862c")
-            ax.fill_between(
-                x, bottoms, bottoms + vals, color=color, alpha=0.8, linewidth=0
-            )
-            ax.plot(x, bottoms + vals, color=color, alpha=0.9, linewidth=1)
-            bottoms += vals
+        # Horizontal, so project names of any length get their own column.
+        y = np.arange(len(projects))
+        project_series = {t: np.array([tool_proj[t].get(p, 0) for p in projects], dtype=float)
+                          for t in order}
+        totals = sum(project_series.values())
+        _stack(ax, y, project_series, width=0.6, horizontal=True,
+               labels={i: _fmt_cost(total) for i, total in enumerate(totals)})
+        ax.set_yticks(y)
+        ax.set_yticklabels(projects, **_font(11))
+        ax.invert_yaxis()
+    elif not use_bars:
+        note = _plot_periods(ax, periods, step, series)
 
-        if len(dates) <= 14:
-            ax.set_xticks(x)
-            ax.set_xticklabels(
-                [_short_date(d) for d in dates], rotation=0, ha="center", **_font(11)
-            )
-        else:
-            step = max(1, len(dates) // 10)
-            ticks = list(range(0, len(dates), step))
-            ax.set_xticks(ticks)
-            ax.set_xticklabels(
-                [_short_date(dates[i]) for i in ticks],
-                rotation=0,
-                ha="center",
-                **_font(11),
-            )
-
-    # Y axis as dollars
-    ax.yaxis.set_major_formatter(
-        ticker.FuncFormatter(lambda v, _: _fmt_cost(v) if v > 0 else "")
-    )
+    # Value axis as dollars, whole unless the ticks fall between them
+    value_axis = ax.xaxis if use_bars else ax.yaxis
+    value_axis.set_major_formatter(ticker.FuncFormatter(
+        lambda v, _: (f"${v:,.0f}" if v == round(v) else f"${v:,.2f}") if v > 0 else ""))
 
     ax.tick_params(colors=TEXT, which="both")
-    for label in ax.get_yticklabels():
+    ax.tick_params(which="minor", length=2, color=DIM)
+    for label in [*ax.get_yticklabels(), *ax.get_xticklabels()]:
         label.set_fontproperties(fm.FontProperties(fname=FONT_PATH, size=11))
-        label.set_color(TEXT)
-    for label in ax.get_xticklabels():
         label.set_color(TEXT)
     for spine in ax.spines.values():
         spine.set_visible(False)
-    ax.grid(axis="y", color=DIM, alpha=0.3, linewidth=0.5)
+    ax.grid(axis="x" if use_bars else "y", color=DIM, alpha=0.3, linewidth=0.5)
 
     # No legend — tool names in subtitle are color-coded instead
 
     # Headline: the savings angle
-    period = (
-        "today"
-        if since_label in ("24h", "1d")
-        else ("this week" if since_label in ("7d", "1w") else "")
-    )
+    period = "today" if since_label in ("24h", "1d") else (
+        "this week" if since_label in ("7d", "1w") else "")
     sub_cost = sum(c for _, c in (plans or {}).values())
 
     # If usage < subscription: show monthly (funny: overpaying)
@@ -221,8 +266,7 @@ def generate(
         days = 30  # default to monthly
         if since_label:
             import re as _re
-
-            m = _re.fullmatch(r"(\d+)([hdw])", since_label)
+            m = _re.fullmatch(r'(\d+)([hdw])', since_label)
             if m:
                 n, unit = int(m.group(1)), m.group(2)
                 days = {"h": n / 24, "d": n, "w": n * 7}[unit]
@@ -257,30 +301,16 @@ def generate(
     renderer = fig.canvas.get_renderer()
     fig_width = fig.get_window_extent(renderer=renderer).width
 
-    cost_txt = fig.text(
-        0.05,
-        0.97,
-        _fmt_cost(total_cost),
-        color=LIGHT,
-        **_font(42, bold=True),
-        ha="left",
-        va="top",
-    )
+    cost_label = ("~" if has_estimates else "") + _fmt_cost(total_cost)
+    cost_txt = fig.text(0.05, 0.97, cost_label, color=LIGHT,
+                        **_font(42, bold=True), ha="left", va="top")
     fig.canvas.draw()
-    x_after_cost = (
-        0.05 + cost_txt.get_window_extent(renderer=renderer).width / fig_width + 0.02
-    )
+    x_after_cost = 0.05 + cost_txt.get_window_extent(renderer=renderer).width / fig_width + 0.02
     if env_parts:
         from matplotlib.offsetbox import OffsetImage, AnnotationBbox
         from matplotlib.image import imread as mpl_imread
-
         emoji_dir = Path(__file__).parent / "emoji"
-        emoji_map = {
-            "kWh": "zap.png",
-            "m\u00b3": "sweat_droplets.png",
-            "L": "sweat_droplets.png",
-            "kg": "factory.png",
-        }
+        emoji_map = {"kWh": "zap.png", "m\u00b3": "sweat_droplets.png", "L": "sweat_droplets.png", "kg": "factory.png"}
 
         ex = x_after_cost
         for part in env_parts:
@@ -295,19 +325,13 @@ def generate(
                 img = mpl_imread(str(emoji_file))
                 im = OffsetImage(img, zoom=0.45)
                 ex += 0.01  # space before emoji
-                ab = AnnotationBbox(
-                    im,
-                    (ex, 0.955),
-                    xycoords="figure fraction",
-                    frameon=False,
-                    box_alignment=(0, 0.5),
-                )
+                ab = AnnotationBbox(im, (ex, 0.955), xycoords='figure fraction',
+                                    frameon=False, box_alignment=(0, 0.5))
                 fig.add_artist(ab)
                 ex += 0.03
 
-            txt = fig.text(
-                ex, 0.97, part, color=TEXT, **_font(42, bold=True), ha="left", va="top"
-            )
+            txt = fig.text(ex, 0.97, part, color=TEXT,
+                           **_font(42, bold=True), ha="left", va="top")
             fig.canvas.draw()
             ex += txt.get_window_extent(renderer=renderer).width / fig_width + 0.015
 
@@ -317,134 +341,104 @@ def generate(
         ratio = total_cost / (sub_cost * days / 30) if days else 0
         if ratio >= 2:
             multiplier = f" ({ratio:.0f}x)"
-    context = f"of AI compute{f' {period}' if period else ''}{sub_label}{multiplier}"
-    fig.text(0.05, 0.89, context, color=TEXT, **_font(14), ha="left", va="top")
+    estimate_note = " (includes processed-token estimates)" if has_estimates else ""
+    context = f"of AI compute{f' {period}' if period else ''}{sub_label}{multiplier}{estimate_note}"
+    fig.text(0.05, 0.87, context, color=TEXT, **_font(14),
+             ha="left", va="top")
 
-    # Third line: colored tool names as legend
+    # Third line: colored tool names as legend, in stack order, with Other last.
     x_pos = 0.05
-    for i, (t, c) in enumerate(tool_costs):
+    for i, (t, c, estimated) in enumerate(shown):
         if i > 0:
-            sep = fig.text(
-                x_pos, 0.84, "  |  ", color=TEXT, **_font(12), ha="left", va="top"
-            )
+            sep = fig.text(x_pos, 0.825, "  |  ", color=TEXT, **_font(12),
+                           ha="left", va="top")
             fig.canvas.draw()
             x_pos += sep.get_window_extent(renderer=renderer).width / fig_width
         color = TOOL_COLORS.get(t, "#c4862c")
         plan_info = plans.get(t) if plans else None
-        label = f"{t} ({plan_info[0]})" if plan_info else t
-        name_txt = fig.text(
-            x_pos, 0.84, label, color=color, **_font(12, bold=True), ha="left", va="top"
-        )
+        details = []
+        if plan_info:
+            details.append(plan_info[0])
+        if estimated:
+            details.append("processed estimate")
+        label = f"{t} ({', '.join(details)})" if details else t
+        name_txt = fig.text(x_pos, 0.825, label, color=color, **_font(12, bold=True),
+                            ha="left", va="top")
         fig.canvas.draw()
         x_pos += name_txt.get_window_extent(renderer=renderer).width / fig_width
-        cost_txt = fig.text(
-            x_pos,
-            0.84,
-            f" {_fmt_cost(c)}",
-            color=TEXT,
-            **_font(12),
-            ha="left",
-            va="top",
-        )
+        cost_prefix = "~" if estimated else ""
+        cost_txt = fig.text(x_pos, 0.825, f" {cost_prefix}{_fmt_cost(c)}", color=TEXT, **_font(12),
+                            ha="left", va="top")
         fig.canvas.draw()
         x_pos += cost_txt.get_window_extent(renderer=renderer).width / fig_width
 
-    fig.text(
-        x_pos,
-        0.84,
-        f"  |  {n_projects} projects",
-        color=TEXT,
-        **_font(12),
-        ha="left",
-        va="top",
-    )
+    if folded:
+        for text, color, bold in (("  |  ", TEXT, False),
+                                  (f"{OTHER} ({len(folded)} tools)", OTHER_COLOR, True),
+                                  (f" {_fmt_cost(sum(c for _, c, _ in folded))}", TEXT, False)):
+            part = fig.text(x_pos, 0.825, text, color=color, **_font(12, bold=bold),
+                            ha="left", va="top")
+            fig.canvas.draw()
+            x_pos += part.get_window_extent(renderer=renderer).width / fig_width
+    fig.text(x_pos, 0.825, f"  |  {n_projects} projects", color=TEXT, **_font(12),
+             ha="left", va="top")
 
-    # Bottom-right: command (show full command only if non-default args used)
+    # Footer: the command that draws this chart, with --since when it is not the default
+    cmd = "uvx clanker-analytics chart"
     if since_label and since_label != "7d":
-        cmd = f"uvx clanker-analytics --since {since_label}"
-    else:
-        cmd = "uvx clanker-analytics"
-    fig.text(0.95, 0.84, cmd, color=DIM, **_font(11), ha="right", va="top")
+        cmd += f" --since {since_label}"
+    fig.text(0.05, 0.01, cmd, color=MUTED, **_font(11), ha="left", va="bottom")
+    if note:
+        # Bottom right, under the hatched bar it explains.
+        fig.text(0.95, 0.01, note, color=MUTED, **_font(11), ha="right", va="bottom")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.78])
-    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(OUTPUT, facecolor=BG, bbox_inches="tight", pad_inches=0.3)
+    plt.tight_layout(rect=[0, 0.04, 1, 0.78])
+    output = output or OUTPUT
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, facecolor=BG, bbox_inches="tight", pad_inches=0.3)
     plt.close(fig)
 
-    return OUTPUT
+    return output
 
 
-def copy_and_open(
-    path: Path,
-    total_cost: float,
-    since_label: str | None,
-    sub_cost: int = 0,
-    cost_mode: str = "auto",
-):
+def copy_and_open(path: Path, total_cost: float, since_label: str | None,
+                  sub_cost: int = 0, cost_mode: str = "auto"):
     """Copy PNG to clipboard and open X compose window."""
     # Copy to clipboard
     copied = False
     if sys.platform == "darwin":
-        copied = (
-            subprocess.run(
-                [
-                    "osascript",
-                    "-e",
-                    f'set the clipboard to (read (POSIX file "{path}") as «class PNGf»)',
-                ],
-                check=False,
-                capture_output=True,
-            ).returncode
-            == 0
-        )
+        copied = subprocess.run(["osascript", "-e",
+                        f'set the clipboard to (read (POSIX file "{path}") as «class PNGf»)'],
+                       check=False, capture_output=True).returncode == 0
     elif sys.platform == "win32":
         try:
             # PowerShell: Set-Clipboard with image
-            copied = (
-                subprocess.run(
-                    [
-                        "powershell",
-                        "-Command",
-                        f"Add-Type -AssemblyName System.Windows.Forms; "
-                        f"[System.Windows.Forms.Clipboard]::SetImage("
-                        f"[System.Drawing.Image]::FromFile('{path}'))",
-                    ],
-                    check=False,
-                    capture_output=True,
-                ).returncode
-                == 0
-            )
+            copied = subprocess.run(
+                ["powershell", "-Command",
+                 f"Add-Type -AssemblyName System.Windows.Forms; "
+                 f"[System.Windows.Forms.Clipboard]::SetImage("
+                 f"[System.Drawing.Image]::FromFile('{path}'))"],
+                check=False, capture_output=True).returncode == 0
         except FileNotFoundError:
             pass
     elif sys.platform == "linux":
-        for cmd in [
-            ["wl-copy", "--type", "image/png"],
-            ["xclip", "-selection", "clipboard", "-t", "image/png"],
-        ]:
+        for cmd in [["wl-copy", "--type", "image/png"],
+                    ["xclip", "-selection", "clipboard", "-t", "image/png"]]:
             try:
                 with open(path, "rb") as f:
-                    if (
-                        subprocess.run(
-                            cmd, stdin=f, check=False, capture_output=True
-                        ).returncode
-                        == 0
-                    ):
+                    if subprocess.run(cmd, stdin=f, check=False, capture_output=True).returncode == 0:
                         copied = True
                         break
             except FileNotFoundError:
                 continue
 
-    period = (
-        "today"
-        if since_label in ("24h", "1d")
-        else ("this week" if since_label in ("7d", "1w") else "")
-    )
+    period = "today" if since_label in ("24h", "1d") else (
+        "this week" if since_label in ("7d", "1w") else "")
     if sub_cost:
         import re as _re
-
         days = 30
         if since_label:
-            m = _re.fullmatch(r"(\d+)([hdw])", since_label)
+            m = _re.fullmatch(r'(\d+)([hdw])', since_label)
             if m:
                 n, unit = int(m.group(1)), m.group(2)
                 days = {"h": n / 24, "d": n, "w": n * 7}[unit]
@@ -464,24 +458,11 @@ def copy_and_open(
 
     opened = False
     if sys.platform == "darwin":
-        opened = (
-            subprocess.run(["open", url], check=False, capture_output=True).returncode
-            == 0
-        )
+        opened = subprocess.run(["open", url], check=False, capture_output=True).returncode == 0
     elif sys.platform == "win32":
-        opened = (
-            subprocess.run(
-                ["cmd", "/c", "start", url], check=False, capture_output=True
-            ).returncode
-            == 0
-        )
+        opened = subprocess.run(["cmd", "/c", "start", url], check=False, capture_output=True).returncode == 0
     elif sys.platform == "linux":
-        opened = (
-            subprocess.run(
-                ["xdg-open", url], check=False, capture_output=True
-            ).returncode
-            == 0
-        )
+        opened = subprocess.run(["xdg-open", url], check=False, capture_output=True).returncode == 0
 
     if opened:
         print(f"  Opened X compose window")

@@ -1,0 +1,1014 @@
+"""Tests for quota snapshot recording and token pace comparison."""
+
+from copy import deepcopy
+from datetime import datetime, timezone
+import json
+import re
+import subprocess
+
+import duckdb
+
+from clanker_analytics import quota
+from clanker_analytics.quota import (
+    QuotaSample,
+    build_quota_history,
+    build_report,
+    build_value_report,
+    connect,
+    insert_samples,
+    normalize_usage_v1,
+    parse_duration,
+    print_report,
+    print_value_report,
+)
+
+from support import Case, approx, raises
+
+
+def _sample(effective_at: str, used_pct: float) -> QuotaSample:
+    return QuotaSample(
+        provider="openai",
+        account_key="default",
+        bucket_id="primary",
+        bucket_label="primary",
+        scope_type="account",
+        scope_id="",
+        window_kind="unknown",
+        window_seconds=259200,
+        effective_at=effective_at,
+        collected_at=effective_at,
+        used_pct=used_pct,
+        resets_at="2026-08-23T12:00:00Z",
+        source="api",
+        source_sample_id=f"primary-{effective_at}",
+    )
+
+
+def _usage_samples(provider, when, windows, account=None, plan=None):
+    """Samples from a usage-v1 document with these (name, seconds, scope, used_pct,
+    resets_at) windows."""
+    document = {
+        "schema": "usage-v1", "provider": provider, "account": account, "plan": plan,
+        "status": "live", "error": None, "retrieved_at": when, "details": {},
+        "windows": [{"name": name, "seconds": seconds, "scope": scope, "used_pct": used,
+                     "resets_at": resets_at}
+                    for name, seconds, scope, used, resets_at in windows],
+    }
+    return normalize_usage_v1(provider, document, datetime.fromisoformat(when.replace("Z", "+00:00")))
+
+
+def _claude_snapshot(when, used, resets_at, account=None):
+    return _usage_samples("anthropic", when, [("weekly", 604800, None, used, resets_at)],
+                          account, "max_20x")
+
+
+def _history_period(tool, resets_at, used_pct, cost, tokens, pricing_flags,
+                    window_minutes=10080):
+    return {
+        "tool": tool, "limit_id": "7d", "resets_at": resets_at, "used_pct": used_pct,
+        "window_minutes": window_minutes, "total_tokens": tokens,
+        "api_equivalent_cost_usd": cost,
+        "full_quota_api_equivalent_cost_estimate_usd": cost * 100 / used_pct,
+        "pricing_flags": pricing_flags,
+    }
+
+
+class TestQuota(Case):
+    def test_parse_duration_accepts_arbitrary_compact_periods(self):
+        assert parse_duration("3h") == 10800
+        assert parse_duration("7h") == 25200
+        assert parse_duration("2w") == 1209600
+
+    def test_claude_login_without_an_account_file_is_unknown(self):
+        tmp_path = self.tmp_path
+        monkeypatch = self.monkeypatch
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+        assert quota.claude_login() == (None, None)
+
+    def test_usage_v1_document_gives_samples_for_each_window(self):
+        # Printed by clanker-usage 0.4.0 for its recorded Z.ai quota response.
+        document = {
+            "schema": "usage-v1", "provider": "zcode", "account": "3f2a9c1e5b7d4a60",
+            "plan": "lite", "status": "live", "error": None,
+            "retrieved_at": "2026-09-05T17:00:00+00:00",
+            "windows": [
+                {"name": "5-hour", "seconds": 18000, "scope": None, "used_pct": 1,
+                 "resets_at": None},
+                {"name": "weekly", "seconds": 604800, "scope": None, "used_pct": 20,
+                 "resets_at": "2026-09-11T03:38:39.995000+00:00"},
+            ],
+            "details": {"limits": [
+                {"type": "CREDIT_LIMIT", "unit": 3, "number": 5, "used": 1, "limit": 100,
+                 "remaining": 99},
+                {"type": "CREDIT_LIMIT", "unit": 6, "number": 1, "used": 2004,
+                 "limit": 10000, "remaining": 7996},
+            ]},
+        }
+        self.monkeypatch.setattr(quota.subprocess, "run", lambda *args, **kwargs:
+                                 subprocess.CompletedProcess(args, 0, json.dumps(document), ""))
+
+        session, week = quota.collect_provider("zai")
+
+        assert (session.provider, session.account_key, session.plan) == ("zai", "3f2a9c1e5b7d4a60", "lite")
+        assert (session.bucket_id, session.window_seconds, session.resets_at) == ("5h", 18000, None)
+        assert (week.bucket_id, week.window_seconds, week.used_pct) == ("1w", 604800, 20)
+        assert week.resets_at == "2026-09-11T03:38:40Z"
+        assert week.effective_at == "2026-09-05T17:00:00Z"
+        assert (week.scope_type, week.window_kind) == ("account", "fixed")
+
+        scoped = {**document, "windows": [{"name": "weekly", "seconds": 604800,
+                                           "scope": "fable", "used_pct": 3, "resets_at": None}]}
+        [sample] = quota.normalize_usage_v1("anthropic", scoped, datetime.now(timezone.utc))
+        assert (sample.bucket_id, sample.scope_type, sample.scope_id) == ("fable:1w", "model", "fable")
+
+    def test_unavailable_usage_v1_document_is_an_error(self):
+        document = {"schema": "usage-v1", "provider": "zcode", "account": None, "plan": None,
+                    "status": "unavailable", "error": "no ZAI_API_KEY found",
+                    "retrieved_at": None, "windows": [], "details": {}}
+        self.monkeypatch.setattr(quota.subprocess, "run", lambda *args, **kwargs:
+                                 subprocess.CompletedProcess(args, 1, json.dumps(document), ""))
+
+        with raises(RuntimeError, match="no ZAI_API_KEY found"):
+            quota.collect_provider("zai")
+
+    def test_antigravity_history_continues_under_usage_v1_names_and_account(self):
+        path = self.tmp_path / "quota.sqlite3"
+        old = [QuotaSample(
+            provider="antigravity", account_key="default", bucket_id=bucket_id,
+            bucket_label=label, scope_type="model_group", scope_id=scope,
+            window_kind="fixed", window_seconds=seconds, effective_at="2026-10-18T12:00:00Z",
+            collected_at="2026-10-18T12:00:00Z", used_pct=10, resets_at="2026-10-24T15:41:29Z",
+            source="api", source_sample_id=bucket_id)
+            for bucket_id, label, scope, seconds in [
+                ("gemini-5h", "Gemini Models 5h", "Gemini Models", 18000),
+                ("gemini-weekly", "Gemini Models weekly", "Gemini Models", 604800),
+                ("3p-5h", "Claude and GPT models 5h", "Claude and GPT models", 18000),
+                ("3p-weekly", "Claude and GPT models weekly", "Claude and GPT models", 604800)]]
+        with connect(path) as db:
+            insert_samples(db, old)
+            # As stored before the rename.
+            db.execute("PRAGMA user_version = 1")
+        # Printed by agy-usage 0.4.0 on this host, with the account replaced.
+        document = {
+            "schema": "usage-v1", "provider": "agy", "account": "0123456789abcdef",
+            "plan": "Google AI Ultra", "status": "live", "error": None,
+            "retrieved_at": "2026-10-19T03:54:42+00:00", "balance": None, "details": {},
+            "windows": [
+                {"name": "weekly", "seconds": 604800, "scope": "Gemini",
+                 "used_pct": 14.583313, "resets_at": "2026-10-24T15:41:29+00:00"},
+                {"name": "5-hour", "seconds": 18000, "scope": "Gemini",
+                 "used_pct": 2.176905, "resets_at": "2026-10-19T05:11:17+00:00"},
+                {"name": "weekly", "seconds": 604800, "scope": "Claude and GPT",
+                 "used_pct": 0, "resets_at": "2026-10-26T03:54:42+00:00"},
+                {"name": "5-hour", "seconds": 18000, "scope": "Claude and GPT",
+                 "used_pct": 0, "resets_at": "2026-10-19T08:54:42+00:00"},
+            ],
+        }
+        self.monkeypatch.setattr(quota.subprocess, "run", lambda *args, **kwargs:
+                                 subprocess.CompletedProcess(args, 0, json.dumps(document), ""))
+
+        quota.record_quota(path, ["antigravity"])
+
+        with connect(path) as db:
+            series = db.execute("""
+                SELECT account_key, bucket_id, bucket_label, scope_type, scope_id, count(*)
+                FROM quota_samples GROUP BY 1, 2, 3, 4, 5 ORDER BY 2
+            """).fetchall()
+        assert [tuple(row) for row in series] == [
+            ("0123456789abcdef", "Claude and GPT:1w", "Claude and GPT weekly", "model", "Claude and GPT", 2),
+            ("0123456789abcdef", "Claude and GPT:5h", "Claude and GPT 5-hour", "model", "Claude and GPT", 2),
+            ("0123456789abcdef", "Gemini:1w", "Gemini weekly", "model", "Gemini", 2),
+            ("0123456789abcdef", "Gemini:5h", "Gemini 5-hour", "model", "Gemini", 2),
+        ]
+
+    def test_codex_history_is_renamed_by_window_length_and_scope(self):
+        path = self.tmp_path / "quota.sqlite3"
+        def sample(bucket_id, scope, seconds, effective_at):
+            return QuotaSample(
+                provider="openai", account_key="default", bucket_id=bucket_id,
+                bucket_label=bucket_id, scope_type="model" if scope else "account",
+                scope_id=scope, window_kind="fixed", window_seconds=seconds,
+                effective_at=effective_at, collected_at=effective_at, used_pct=1,
+                resets_at=None, source="api", source_sample_id=bucket_id + effective_at)
+        with connect(path) as db:
+            insert_samples(db, [
+                # On one plan the weekly window was primary; on the next it is secondary.
+                sample("primary", "", 604800, "2026-10-01T00:00:00Z"),
+                sample("primary", "", 18000, "2026-10-17T00:00:00Z"),
+                sample("secondary", "", 604800, "2026-10-17T00:00:00Z"),
+                sample("additional:gpt-5-3-codex-spark:primary", "GPT-5.3-Codex-Spark", 18000,
+                       "2026-09-01T00:00:00Z"),
+            ])
+            db.execute("PRAGMA user_version = 2")
+        with connect(path) as db:
+            rows = db.execute("""
+                SELECT bucket_id, bucket_label, count(*) FROM quota_samples
+                GROUP BY 1, 2 ORDER BY 1
+            """).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("1w", "weekly", 2), ("5h", "5-hour", 1),
+            ("GPT-5.3-Codex-Spark:5h", "GPT-5.3-Codex-Spark 5-hour", 1)]
+
+    def test_claude_history_moves_to_usage_v1_names_and_account(self):
+        path = self.tmp_path / "quota.sqlite3"
+        old = _usage_samples("anthropic", "2026-10-18T12:00:00Z", [
+            ("5-hour", 18000, None, 10, "2026-10-18T14:00:00Z"),
+            ("weekly", 604800, None, 40, "2026-10-23T14:00:00Z"),
+            ("weekly", 604800, "Fable", 1, "2026-10-23T14:00:00Z"),
+        ], "org-one", "max_20x")
+        with connect(path) as db:
+            insert_samples(db, old)
+            # As ccusage before 0.4.0 stored them.
+            db.execute("""UPDATE quota_samples SET bucket_id = CASE bucket_id
+                WHEN '5h' THEN 'session' WHEN '1w' THEN '7d' ELSE '7d_fable' END,
+                scope_id = CASE WHEN scope_id = 'Fable' THEN 'fable' ELSE scope_id END""")
+            db.execute("INSERT INTO quota_accounts VALUES ('anthropic', 'org-one', 'one@example.com')")
+            db.execute("PRAGMA user_version = 3")
+        # Printed by ccusage 0.4.0 on this host, with the account replaced.
+        document = {
+            "schema": "usage-v1", "provider": "claude", "account": "fedcba9876543210",
+            "plan": "max_20x", "status": "live", "error": None,
+            "retrieved_at": "2026-10-19T04:08:01+00:00", "balance": None, "details": {},
+            "windows": [
+                {"name": "5-hour", "seconds": 18000, "scope": None, "used_pct": 22,
+                 "resets_at": "2026-10-19T04:59:59.946776+00:00"},
+                {"name": "weekly", "seconds": 604800, "scope": None, "used_pct": 42,
+                 "resets_at": "2026-10-23T13:59:59.946796+00:00"},
+                {"name": "weekly", "seconds": 604800, "scope": "Fable", "used_pct": 0,
+                 "resets_at": "2026-10-23T14:00:00+00:00"},
+            ],
+        }
+        self.monkeypatch.setattr(quota.subprocess, "run", lambda *args, **kwargs:
+                                 subprocess.CompletedProcess(args, 0, json.dumps(document), ""))
+        self.monkeypatch.setattr(quota, "claude_login", lambda: ("org-one", "one@example.com"))
+
+        self.monkeypatch.setattr(quota, "CACHE_DIR", self.tmp_path / "cache")
+        quota.record_quota(path, ["anthropic"])
+
+        with connect(path) as db:
+            series = db.execute("""
+                SELECT account_key, bucket_id, scope_id, count(*), max(resets_at)
+                FROM quota_samples GROUP BY 1, 2, 3 ORDER BY 2
+            """).fetchall()
+            labels = db.execute("SELECT * FROM quota_accounts").fetchall()
+        assert [tuple(row) for row in series] == [
+            ("fedcba9876543210", "1w", "", 2, "2026-10-23T14:00:00Z"),
+            ("fedcba9876543210", "5h", "", 2, "2026-10-19T05:00:00Z"),
+            ("fedcba9876543210", "Fable:1w", "Fable", 2, "2026-10-23T14:00:00Z"),
+        ]
+        assert [tuple(row) for row in labels] == [("anthropic", "fedcba9876543210", "one@example.com")]
+
+    def test_unnamed_history_stays_unnamed_when_a_provider_has_two_accounts(self):
+        path = self.tmp_path / "quota.sqlite3"
+        def sample(account, effective_at):
+            return QuotaSample(
+                provider="zai", account_key=account, bucket_id="1w", bucket_label="1w",
+                scope_type="account", scope_id="", window_kind="fixed", window_seconds=604800,
+                effective_at=effective_at, collected_at=effective_at, used_pct=1,
+                resets_at=None, source="api", source_sample_id=account + effective_at)
+        with connect(path) as db:
+            insert_samples(db, [sample("default", "2026-09-01T00:00:00Z"),
+                                sample("first", "2026-09-02T00:00:00Z")])
+            new = [sample("second", "2026-09-03T00:00:00Z")]
+            insert_samples(db, new)
+            assert quota.adopt_unnamed_history(db, new) == 0
+
+    def test_fixed_window_lookback_does_not_cross_reset(self):
+        tmp_path = self.tmp_path
+        previous = QuotaSample(
+            provider="antigravity", account_key="default", bucket_id="gemini-5h",
+            bucket_label="Gemini Models 5h", scope_type="model_group",
+            scope_id="Gemini Models", window_kind="fixed", window_seconds=18000,
+            effective_at="2026-08-21T06:00:00Z",
+            collected_at="2026-08-21T06:00:00Z", used_pct=40,
+            resets_at="2026-08-21T07:00:00Z", source="api",
+            source_sample_id="previous-cycle",
+        )
+        current = QuotaSample(
+            provider="antigravity", account_key="default", bucket_id="gemini-5h",
+            bucket_label="Gemini Models 5h", scope_type="model_group",
+            scope_id="Gemini Models", window_kind="fixed", window_seconds=18000,
+            effective_at="2026-08-21T12:00:00Z",
+            collected_at="2026-08-21T12:00:00Z", used_pct=10,
+            resets_at="2026-08-21T17:00:00Z", source="api",
+            source_sample_id="current-cycle",
+        )
+        with connect(tmp_path / "quota.sqlite3") as quota_db:
+            insert_samples(quota_db, [previous, current])
+            token_db = duckdb.connect()
+            token_db.execute("""
+                CREATE TABLE tokens (
+                    tool VARCHAR, model VARCHAR, rate_mode VARCHAR,
+                    total_tokens BIGINT, cost_usd DOUBLE, timestamp VARCHAR
+                )
+            """)
+            report = build_report(
+                quota_db, token_db, [parse_duration("6h")], "cost_usd",
+                include_inactive=True,
+            )
+
+        bucket = report["buckets"][0]
+        assert bucket["forecast_basis"] == "fixed_window"
+        assert bucket["lookbacks"][0]["quality"] == "collecting_history"
+
+    def test_pace_skips_a_login_that_was_switched_away_from(self):
+        tmp_path = self.tmp_path
+        with connect(tmp_path / "quota.sqlite3") as quota_db:
+            insert_samples(quota_db, [
+                *_claude_snapshot("2026-10-03T01:00:00Z", 99, "2026-10-06T13:00:00Z", "org-one"),
+                *_claude_snapshot("2026-10-03T06:00:00Z", 25, "2026-10-09T14:00:00Z", "org-two"),
+            ])
+            token_db = duckdb.connect()
+            token_db.execute("""
+                CREATE TABLE tokens (
+                    tool VARCHAR, model VARCHAR, rate_mode VARCHAR,
+                    total_tokens BIGINT, cost_usd DOUBLE, timestamp VARCHAR
+                )
+            """)
+            report = build_report(quota_db, token_db, [parse_duration("6h")], "cost_usd",
+                                  include_inactive=True)
+
+        assert {bucket["account_key"] for bucket in report["buckets"]} == {"org-two"}
+
+    def test_pace_measures_each_account_over_the_time_its_quota_rose(self):
+        tmp_path = self.tmp_path
+        capsys = self.capsys
+
+        def snapshots(account, resets_at, readings):
+            return [sample for when, used in readings
+                    for sample in _claude_snapshot(when, used, resets_at, account)]
+
+        with connect(tmp_path / "quota.sqlite3") as quota_db:
+            insert_samples(quota_db, [
+                # Used for 10 minutes, then switched away from with its week still open.
+                *snapshots("org-one", "2026-10-13T13:00:00Z", [
+                    ("2026-10-10T23:30:00Z", 98), ("2026-10-10T23:35:00Z", 99),
+                    ("2026-10-10T23:40:00Z", 100)]),
+                # A day into its week before its first use, then two 10-minute stretches
+                # of use with five idle hours between them.
+                *snapshots("org-two", "2026-10-16T14:00:00Z", [
+                    ("2026-10-10T23:45:00Z", 1), ("2026-10-10T23:50:00Z", 2),
+                    ("2026-10-10T23:55:00Z", 3), ("2026-10-11T05:00:00Z", 3),
+                    ("2026-10-11T05:05:00Z", 4), ("2026-10-11T05:10:00Z", 5)]),
+            ])
+            quota_db.execute(
+                "INSERT INTO quota_accounts VALUES ('anthropic', 'org-two', 'second@example.com')")
+            token_db = duckdb.connect()
+            token_db.execute("""
+                CREATE TABLE tokens (
+                    tool VARCHAR, model VARCHAR, rate_mode VARCHAR,
+                    total_tokens BIGINT, cost_usd DOUBLE, timestamp VARCHAR
+                )
+            """)
+            report = build_report(quota_db, token_db, [parse_duration("5m")], "cost_usd",
+                                  include_inactive=True)
+
+        current = report["buckets"][0]
+        assert current["account_label"] == "second"
+        # 4 points in 20 minutes of use is 12 points an hour; even use is 100 in 168 hours.
+        assert current["window_pace"]["active_hours"] == approx(20 / 60)
+        assert current["window_pace"]["quota_pp_per_hour"] == approx(12)
+        assert current["window_pace"]["pace_ratio"] == approx(12 * 168 / 100)
+        away = report["inactive_buckets"][0]
+        assert away["account_key"] == "org-one"
+        assert away["last_used_at"] == "2026-10-10T23:40:00Z"
+        assert away["window_pace"]["quota_pp_per_hour"] == approx(12)
+
+        print_report(report)
+        output = capsys.readouterr().out
+        assert re.search(r"claude\s+second\s+Week \(all models\)\s+5\.0%\s+0\.3\s+12\.000\s+"
+                         r"20\.16x\s+in use", output)
+        assert re.search(r"claude\s+org-one\s+Week \(all models\)\s+100\.0%.*"
+                         r"last used 2026-10-10 23:40Z", output)
+
+    def test_pace_counts_only_the_time_an_account_was_used_when_every_account_is_recorded(self):
+        def snapshots(account, resets_at, readings):
+            return [sample for when, used in readings
+                    for sample in _claude_snapshot(when, used, resets_at, account)]
+
+        times = [f"2026-10-11T{hour:02d}:{minute:02d}:00Z"
+                 for hour in range(10, 13) for minute in range(0, 60, 5)]
+        with connect(self.tmp_path / "quota.sqlite3") as quota_db:
+            insert_samples(quota_db, [
+                # Recorded all along but idle, with quota left from earlier in its week.
+                *snapshots("idle", "2026-10-13T13:00:00Z", [(when, 40) for when in times]),
+                # In use for its first hour, rising a point every 15 minutes, then idle.
+                *snapshots("busy", "2026-10-16T14:00:00Z", [
+                    (when, 10 + min(index, 12) // 3) for index, when in enumerate(times)]),
+            ])
+            token_db = duckdb.connect()
+            token_db.execute("""
+                CREATE TABLE tokens (
+                    tool VARCHAR, model VARCHAR, rate_mode VARCHAR,
+                    total_tokens BIGINT, cost_usd DOUBLE, timestamp VARCHAR
+                )
+            """)
+            report = build_report(quota_db, token_db, [parse_duration("5m")], "cost_usd",
+                                  include_inactive=True)
+
+        [current] = report["buckets"]
+        assert current["account_key"] == "busy"
+        # Rises at 10:15, 10:30, 10:45 and 11:00 join into one stretch from 10:10 to 11:00.
+        assert current["window_pace"]["active_hours"] == approx(50 / 60)
+        assert current["window_pace"]["quota_gained_pct"] == 4
+        # An account whose quota never rose has no time in use to pace.
+        assert report["inactive_buckets"] == []
+
+    def test_recording_reads_every_cached_claude_account(self):
+        tmp_path = self.tmp_path
+        monkeypatch = self.monkeypatch
+        cache = tmp_path / "cache" / "clanker-usage" / "claude"
+        cache.mkdir(parents=True)
+
+        def document(account, status, used):
+            return {"schema": "usage-v1", "provider": "claude", "account": account,
+                    "plan": "max_20x", "status": status, "error": None,
+                    "retrieved_at": "2026-10-20T12:08:04+00:00", "details": {},
+                    "windows": [{"name": "weekly", "seconds": 604800, "scope": None,
+                                 "used_pct": used, "resets_at": "2026-10-20T13:00:00+00:00"}]}
+
+        for account, status, used in [("default-login", "live", 1), ("second", "cached", 100),
+                                      ("third", "stale", 50), ("gone", "unavailable", 0)]:
+            (cache / f"{account}.json").write_text(json.dumps(document(account, status, used)))
+        (cache / "broken.json").write_text("{")
+        live = document("default-login", "live", 2)
+        live["retrieved_at"] = "2026-10-20T12:10:00+00:00"
+        monkeypatch.setattr(quota, "CACHE_DIR", tmp_path / "cache")
+        monkeypatch.setattr(quota.subprocess, "run", lambda *args, **kwargs:
+                            subprocess.CompletedProcess(args, 0, json.dumps(live), ""))
+        monkeypatch.setattr(quota, "claude_login", lambda: (None, None))
+        path = tmp_path / "quota.sqlite3"
+
+        assert quota.record_quota(path, ["anthropic"]) == (3, [])
+        # An unchanged cached document adds nothing the next time.
+        assert quota.record_quota(path, ["anthropic"]) == (0, [])
+        with connect(path) as db:
+            rows = db.execute("""
+                SELECT account_key, effective_at, used_pct FROM quota_samples ORDER BY 1
+            """).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("default-login", "2026-10-20T12:10:00Z", 2),
+            ("second", "2026-10-20T12:08:04Z", 100),
+            ("third", "2026-10-20T12:08:04Z", 50)]
+
+    def test_recording_stores_the_claude_login_email(self):
+        tmp_path = self.tmp_path
+        monkeypatch = self.monkeypatch
+        (tmp_path / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"organizationUuid": "org-second",
+                              "emailAddress": "second@example.com"}}))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        output = json.dumps({
+            "schema": "usage-v1", "provider": "claude", "account": "account-second",
+            "plan": "max_20x", "status": "live", "error": None,
+            "retrieved_at": "2026-10-03T01:14:00Z", "details": {},
+            "windows": [{"name": "weekly", "seconds": 604800, "scope": None, "used_pct": 1,
+                         "resets_at": "2026-10-09T14:00:00Z"}]})
+        commands = []
+        def run(cmd, **kwargs):
+            commands.append(cmd[1:])
+            return subprocess.CompletedProcess(cmd, 0, output, "")
+        monkeypatch.setattr(quota.subprocess, "run", run)
+
+        monkeypatch.setattr(quota, "CACHE_DIR", tmp_path / "cache")
+        quota.record_quota(tmp_path / "quota.sqlite3", ["anthropic"])
+
+        assert commands == [["-m", "clanker_usage", "claude", "json"]]
+        with connect(tmp_path / "quota.sqlite3") as quota_db:
+            assert quota.account_labels(quota_db) == {("anthropic", "account-second"): "second"}
+
+    def test_window_price_comes_from_its_completed_periods(self):
+        def period(resets_at, used, cost, account="acct", limit="acct:Gemini:5h", plan="ultra_100",
+                   tool="Agy", minutes=300):
+            return {"tool": tool, "limit_id": limit, "window_minutes": minutes, "account": account,
+                    "plan": plan, "resets_at": resets_at, "used_pct": used,
+                    "api_equivalent_cost_usd": cost}
+
+        bucket = {"provider": "antigravity", "account_key": "acct", "bucket_id": "Gemini:5h",
+                  "scope_id": "Gemini", "window_seconds": 18000, "plan": "ultra_100"}
+        periods = [
+            period("2026-10-30T10:00:00Z", 40, 12.0),
+            # A reading from before the tier id was recorded names the same plan ambiguously.
+            period("2026-10-30T15:00:00Z", 60, 18.0, plan="Google AI Ultra"),
+            # Used where the local logs cannot see.
+            period("2026-10-30T20:00:00Z", 30, 0.0),
+            # Too little use to price, another account, another window and a running period.
+            period("2026-10-31T01:00:00Z", 2, 5.0),
+            period("2026-10-30T10:00:00Z", 50, 99.0, account="other", limit="other:Gemini:5h"),
+            period("2026-10-30T10:00:00Z", 50, 99.0, limit="acct:Gemini:1w", minutes=10080),
+            period("2026-11-01T22:00:00Z", 50, 99.0),
+        ]
+        now = datetime(2026, 11, 1, 20, tzinfo=timezone.utc)
+
+        price = quota.history_calibration(periods, bucket, now)
+
+        assert price["api_usd_per_quota_percentage_point"] == approx(30 / 100)
+        assert (price["periods"], price["quota_pp"], price["unaccounted_periods"],
+                price["unaccounted_pp"]) == (2, 100, 1, 30)
+
+        # A period on another priced plan buys a different amount of use per point.
+        codex = {"provider": "openai", "account_key": "acct", "bucket_id": "1w", "scope_id": "",
+                 "window_seconds": 604800, "plan": "plus"}
+        weeks = [period("2026-10-01T00:00:00Z", 50, 1000.0, account="default", limit="codex",
+                        plan="pro", tool="Codex", minutes=10080),
+                 period("2026-10-20T00:00:00Z", 50, 100.0, account="default", limit="codex",
+                        plan="plus", tool="Codex", minutes=10080)]
+        assert quota.history_calibration(weeks, codex, now)["api_usd_per_quota_percentage_point"] == approx(2)
+
+    def test_window_without_periods_is_priced_from_a_sibling_window(self):
+        def snapshot(minute, short, week, plan="plus", short_reset="2026-11-01T05:00:00Z"):
+            when = f"2026-11-01T{minute // 60:02d}:{minute % 60:02d}:00Z"
+            return _usage_samples("openai", when, [
+                ("5-hour", 18000, None, short, short_reset),
+                ("weekly", 604800, None, week, "2026-11-04T00:00:00Z")], "acct", plan)
+
+        with connect(self.tmp_path / "quota.sqlite3") as db:
+            insert_samples(db, [
+                # The 5-hour window rises 30 points while the weekly one rises 6.
+                *snapshot(0, 0, 10), *snapshot(5, 10, 12), *snapshot(10, 30, 16),
+                # A reset of the 5-hour window, and a reading on another plan, are not paired.
+                *snapshot(15, 2, 16, short_reset="2026-11-01T10:00:00Z"),
+                *snapshot(20, 50, 30, plan="pro", short_reset="2026-11-01T10:00:00Z"),
+            ])
+            bucket = {"provider": "openai", "account_key": "acct", "bucket_id": "5h",
+                      "scope_id": "", "plan": "plus"}
+            sibling = {"provider": "openai", "account_key": "acct", "bucket_id": "1w", "scope_id": ""}
+
+            derived = quota.sibling_calibration(db, bucket, sibling, 3.0)
+
+        assert derived["sibling_pp_per_pp"] == approx(6 / 30)
+        assert derived["api_usd_per_quota_percentage_point"] == approx(3.0 * 6 / 30)
+        assert (derived["intervals"], derived["quota_pp"], derived["sibling_quota_pp"]) == (2, 30, 6)
+
+    def test_snapshot_insert_is_idempotent(self):
+        tmp_path = self.tmp_path
+        with connect(tmp_path / "quota.sqlite3") as db:
+            assert insert_samples(db, [_sample("2026-08-21T06:00:00Z", 14)]) == 1
+            assert insert_samples(db, [_sample("2026-08-21T06:00:00Z", 14)]) == 0
+
+    def test_report_compares_quota_and_token_derived_pace(self):
+        tmp_path = self.tmp_path
+        with connect(tmp_path / "quota.sqlite3") as quota_db:
+            insert_samples(quota_db, [
+                _sample("2026-08-21T06:00:00Z", 14),
+                _sample("2026-08-21T12:00:00Z", 20),
+            ])
+            token_db = duckdb.connect()
+            token_db.execute("""
+                CREATE TABLE tokens (
+                    tool VARCHAR, model VARCHAR, rate_mode VARCHAR,
+                    total_tokens BIGINT, cost_usd DOUBLE, timestamp VARCHAR
+                )
+            """)
+            token_db.executemany(
+                "INSERT INTO tokens VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("Codex", "gpt-5.6-sol", "default", 1000, 4.0,
+                     "2026-08-20T18:00:00Z"),
+                    ("Codex", "gpt-5.6-terra", "default", 2000, 6.0,
+                     "2026-08-21T07:00:00Z"),
+                ],
+            )
+
+            report = build_report(quota_db, token_db, [parse_duration("6h")], "cost_usd")
+
+        bucket = report["buckets"][0]
+        interval = bucket["lookbacks"][0]
+        assert bucket["token_calibration"]["api_usd_per_quota_percentage_point"] == 0.5
+        assert interval["quota_delta_pp_per_hour"] == 1.0
+        assert interval["token_derived_pp_per_hour"] == 2.0
+        assert interval["model_mix"][0]["model"] == "gpt-5.6-terra"
+        assert interval["quality"] == "full"
+        assert bucket["forecast_basis"] == "reported_openai_reset"
+        assert bucket["target_percentage_points_per_hour"] == approx(5 / 3)
+        assert interval["observed_pace_source"] == "quota_delta"
+        assert interval["uncapped_projected_used_pct"] == approx(68)
+        assert interval["headroom_pct"] == approx(2 / 3 * 100)
+        assert interval["guidance"] == "headroom 67%"
+
+    def test_flat_quantized_quota_uses_token_derived_pace(self):
+        tmp_path = self.tmp_path
+        with connect(tmp_path / "quota.sqlite3") as quota_db:
+            insert_samples(quota_db, [
+                _sample("2026-08-21T06:00:00Z", 20),
+                _sample("2026-08-21T12:00:00Z", 20),
+            ])
+            token_db = duckdb.connect()
+            token_db.execute("""
+                CREATE TABLE tokens (
+                    tool VARCHAR, model VARCHAR, rate_mode VARCHAR,
+                    total_tokens BIGINT, cost_usd DOUBLE, timestamp VARCHAR
+                )
+            """)
+            token_db.executemany(
+                "INSERT INTO tokens VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("Codex", "gpt-5.6-sol", "default", 1000, 4.0,
+                     "2026-08-20T18:00:00Z"),
+                    ("Codex", "gpt-5.6-sol", "default", 1000, 2.0,
+                     "2026-08-21T07:00:00Z"),
+                ],
+            )
+            report = build_report(
+                quota_db, token_db, [parse_duration("6h")], "cost_usd"
+            )
+
+        interval = report["buckets"][0]["lookbacks"][0]
+        assert interval["quota_delta_pp_per_hour"] == 0
+        assert interval["token_derived_pp_per_hour"] == approx(10 / 9)
+        assert interval["observed_pace_source"] == "token_derived"
+
+    def test_pace_table_columns_are_aligned(self):
+        tmp_path = self.tmp_path
+        capsys = self.capsys
+        with connect(tmp_path / "quota.sqlite3") as quota_db:
+            insert_samples(quota_db, [
+                _sample("2026-08-21T06:00:00Z", 14),
+                _sample("2026-08-21T12:00:00Z", 20),
+            ])
+            token_db = duckdb.connect()
+            token_db.execute("""
+                CREATE TABLE tokens (
+                    tool VARCHAR, model VARCHAR, rate_mode VARCHAR,
+                    total_tokens BIGINT, cost_usd DOUBLE, timestamp VARCHAR
+                )
+            """)
+            token_db.executemany(
+                "INSERT INTO tokens VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("Codex", "gpt-5.6-sol", "default", 1000, 4.0,
+                     "2026-08-20T18:00:00Z"),
+                    ("Codex", "gpt-5.6-sol", "default", 1000, 6.0,
+                     "2026-08-21T07:00:00Z"),
+                ],
+            )
+            report = build_report(quota_db, token_db, [parse_duration("6h")], "cost_usd")
+
+        agy_bucket = deepcopy(report["buckets"][0])
+        agy_bucket.update({
+            "provider": "antigravity",
+            "bucket_label": "Gemini Models weekly",
+            "scope_id": "Gemini Models",
+            "window_seconds": 604800,
+            "target_percentage_points_per_hour": None,
+            "forecast_basis": None,
+        })
+        report["buckets"].append(agy_bucket)
+
+        print_report(report)
+        output = capsys.readouterr().out
+        lines = output.splitlines()
+        header = next(line for line in lines if "projected" in line)
+        row = next(line for line in lines if line.startswith("codex"))
+        for heading, value in (
+            ("quota pp/h", "1.000"),
+            ("token pp/h", "2.000"),
+            ("local $/h", "$1.000"),
+        ):
+            assert header.index(heading) + len(heading) == row.index(value) + len(value)
+        assert "quality" not in header
+        assert "target pp/h" not in header
+        assert "model mix" not in header
+        assert "gpt-5.6-sol" not in output
+        assert "target pace: codex Primary 1.667 quota pp/h" in output
+        assert sum("projected" in line for line in lines) == 1
+        assert any(line.startswith("agy") for line in lines)
+        assert "Gemini (weekly)" in output
+        assert (
+            "Projection unavailable for agy Gemini (weekly): window semantics are unknown; "
+            "quota pp/h is a net trend only."
+        ) in output
+        assert "Lookback coverage:" not in output
+
+        print_report(report, show_model_mix=True)
+        output = capsys.readouterr().out
+        header = next(line for line in output.splitlines() if "projected" in line)
+        assert "model mix" in header
+        assert "gpt-5.6-sol 100%" in output
+
+    def test_pace_table_hides_incomplete_lookbacks(self):
+        tmp_path = self.tmp_path
+        capsys = self.capsys
+        with connect(tmp_path / "quota.sqlite3") as quota_db:
+            insert_samples(quota_db, [
+                _sample("2026-08-21T06:00:00Z", 14),
+                _sample("2026-08-21T12:00:00Z", 20),
+            ])
+            token_db = duckdb.connect()
+            token_db.execute("""
+                CREATE TABLE tokens (
+                    tool VARCHAR, model VARCHAR, rate_mode VARCHAR,
+                    total_tokens BIGINT, cost_usd DOUBLE, timestamp VARCHAR
+                )
+            """)
+            report = build_report(
+                quota_db,
+                token_db,
+                [parse_duration("4h"), parse_duration("8h")],
+                "cost_usd",
+                include_inactive=True,
+            )
+
+        print_report(report)
+        output = capsys.readouterr().out
+        assert "quality" not in output
+        assert "Lookback coverage:" not in output
+        assert "4h" not in output
+        assert "8h" not in output
+        assert output.rstrip().endswith("No complete lookbacks yet.")
+        qualities = [interval["quality"] for interval in report["buckets"][0]["lookbacks"]]
+        assert qualities == ["partial", "collecting_history"]
+
+    def test_report_hides_inactive_buckets_by_default(self):
+        tmp_path = self.tmp_path
+        with connect(tmp_path / "quota.sqlite3") as quota_db:
+            insert_samples(quota_db, [
+                _sample("2026-08-21T06:00:00Z", 14),
+                _sample("2026-08-21T12:00:00Z", 14),
+            ])
+            token_db = duckdb.connect()
+            token_db.execute("""
+                CREATE TABLE tokens (
+                    tool VARCHAR, model VARCHAR, rate_mode VARCHAR,
+                    total_tokens BIGINT, cost_usd DOUBLE, timestamp VARCHAR
+                )
+            """)
+
+            filtered = build_report(quota_db, token_db, [parse_duration("6h")], "cost_usd")
+            complete = build_report(
+                quota_db,
+                token_db,
+                [parse_duration("6h")],
+                "cost_usd",
+                include_inactive=True,
+            )
+
+        assert filtered["buckets"] == []
+        assert filtered["hidden_bucket_count"] == 1
+        assert complete["bucket_filter"] == "all"
+        assert len(complete["buckets"]) == 1
+
+    def test_quota_history_estimates_full_cost_from_last_period_observation(self):
+        db = duckdb.connect()
+        db.execute("""
+            CREATE TABLE tokens (
+                tool VARCHAR,
+                model VARCHAR,
+                rate_mode VARCHAR,
+                source_kind VARCHAR,
+                input_tokens BIGINT,
+                output_tokens BIGINT,
+                cache_write_tokens BIGINT,
+                cache_read_tokens BIGINT,
+                total_tokens BIGINT,
+                cost_usd DOUBLE,
+                timestamp VARCHAR,
+                quota_used_pct DOUBLE,
+                quota_resets_at BIGINT,
+                quota_window_minutes INTEGER,
+                quota_limit_id VARCHAR
+            )
+        """)
+        first_reset = int(datetime(2026, 8, 20, tzinfo=timezone.utc).timestamp())
+        second_reset = int(datetime(2026, 8, 27, tzinfo=timezone.utc).timestamp())
+        unused_reset = int(datetime(2026, 9, 3, tzinfo=timezone.utc).timestamp())
+        db.executemany(
+            "INSERT INTO tokens VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("Codex", "gpt-5.6-sol", "default", "native", 10, 5, 0, 85, 100,
+                 10.0, "2026-08-14T00:00:00Z", 20, first_reset, 10080, "codex"),
+                ("Codex", "gpt-5.6-sol", "default", "native", 20, 5, 0, 75, 100,
+                 15.0, "2026-08-19T23:00:00Z", 50, first_reset, 10080, "codex"),
+                ("Codex", "gpt-5.6-sol", "default", "native", 0, 0, 0, 0, 0,
+                 0.0, "2026-08-19T23:30:00Z", 50, first_reset + 20, 10080, "codex"),
+                ("Codex", "gpt-5.6-sol", "default", "native", 10, 5, 0, 85, 100,
+                 20.0, "2026-08-21T00:00:00Z", 25, second_reset, 10080, "codex"),
+                ("Codex", "gpt-5.6-sol", "default", "native", 10, 5, 0, 85, 100,
+                 5.0, "2026-08-28T00:00:00Z", 0, unused_reset, 10080, "codex"),
+            ],
+        )
+
+        db.execute("ALTER TABLE tokens ADD COLUMN pricing VARCHAR DEFAULT 'model-prices'")
+        report = build_quota_history(db, "cost_usd", "test-rate-card")
+
+        first, second = report["periods"]
+        assert len(report["periods"]) == 2
+        assert report["pricing_basis"] == "test-rate-card"
+        assert first["used_pct"] == 50
+        assert first["api_equivalent_cost_usd"] == 25
+        assert first["full_quota_api_equivalent_cost_estimate_usd"] == 50
+        assert first["cached_input_pct"] == 160 / 190 * 100
+        assert first["pricing_flags"] == []
+        assert second["full_quota_api_equivalent_cost_estimate_usd"] == 80
+        assert second["change_from_previous_estimate_pct"] == approx(60)
+
+    def test_quota_history_combines_recorded_snapshots_and_embedded_limit_hits(self):
+        tmp_path = self.tmp_path
+        db = duckdb.connect()
+        db.execute("""
+            CREATE TABLE tokens (
+                tool VARCHAR, model VARCHAR, rate_mode VARCHAR, source_kind VARCHAR,
+                input_tokens BIGINT, output_tokens BIGINT, cache_write_tokens BIGINT,
+                cache_read_tokens BIGINT, total_tokens BIGINT, cost_usd DOUBLE,
+                timestamp VARCHAR, quota_used_pct DOUBLE, quota_resets_at BIGINT,
+                quota_window_minutes INTEGER, quota_limit_id VARCHAR
+            )
+        """)
+        zcode_reset = int(datetime(2026, 9, 27, 19, 11, 57, tzinfo=timezone.utc).timestamp())
+        db.executemany(
+            "INSERT INTO tokens VALUES (?, ?, '', 'native', 0, 0, 0, 0, 100, ?, ?, ?, ?, ?, ?)",
+            [
+                ("Zcode", "zai/glm-5.3", 3.0, "2026-09-27T14:12:00Z", None, None, None, None),
+                ("Zcode", "zai/glm-5.3", 3.0, "2026-09-27T15:00:00Z", None, None, None, None),
+                ("Zcode", "zai/glm-5.3", 0.0, "2026-09-27T15:21:03Z", 100, zcode_reset, 300, "5h"),
+                ("Zcode", "zai/glm-5.3", 5.0, "2026-09-27T16:00:00Z", None, None, None, None),
+                ("Claude Code", "claude-opus-5-5", 40.0, "2026-09-25T00:00:00Z",
+                 None, None, None, None),
+                ("Claude Code", "claude-fable-5-1", 10.0, "2026-09-25T00:00:00Z",
+                 None, None, None, None),
+            ],
+        )
+        with connect(tmp_path / "quota.sqlite3") as connection:
+            insert_samples(connection, [
+                *_usage_samples("zai", "2026-09-27T15:30:00Z", [
+                    ("5-hour", 18000, None, 50, "2026-09-27T20:24:52Z")]),
+                *_usage_samples("anthropic", "2026-09-26T00:00:00Z", [
+                    ("weekly", 604800, None, 50, "2026-09-29T13:00:00Z"),
+                    ("weekly", 604800, "Fable", 20, "2026-09-29T13:00:00Z"),
+                ], plan="max_20x"),
+            ])
+            db.execute("ALTER TABLE tokens ADD COLUMN pricing VARCHAR DEFAULT 'model-prices'")
+            report = build_quota_history(db, "cost_usd", "test-rate-card", connection)
+
+        periods = {(item["tool"], item["limit_id"], item["resets_at"]): item
+                   for item in report["periods"]}
+        assert report["report_type"] == "quota_history"
+        hit = periods[("Zcode", "5h", "2026-09-27T19:11:57Z")]
+        assert hit["used_pct"] == 100
+        assert hit["window_start"] == "2026-09-27T14:11:57Z"
+        assert hit["full_quota_api_equivalent_cost_estimate_usd"] == 6.0
+        assert hit["change_from_previous_estimate_pct"] is None
+        recorded = periods[("Zcode", "5h", "2026-09-27T20:24:52Z")]
+        assert recorded["full_quota_api_equivalent_cost_estimate_usd"] == 0.0
+        assert recorded["change_from_previous_estimate_pct"] == -100
+        week = periods[("Claude Code", "1w", "2026-09-29T13:00:00Z")]
+        assert week["full_quota_api_equivalent_cost_estimate_usd"] == 100
+        fable = periods[("Claude Code", "Fable:1w", "2026-09-29T13:00:00Z")]
+        assert fable["full_quota_api_equivalent_cost_estimate_usd"] == 50
+        assert [item["model"] for item in fable["model_mix"]] == ["claude-fable-5-1"]
+
+    def test_two_claude_logins_get_separate_quota_periods_and_value(self):
+        tmp_path = self.tmp_path
+        db = duckdb.connect()
+        db.execute("""
+            CREATE TABLE tokens (
+                tool VARCHAR, model VARCHAR, rate_mode VARCHAR, source_kind VARCHAR,
+                input_tokens BIGINT, output_tokens BIGINT, cache_write_tokens BIGINT,
+                cache_read_tokens BIGINT, total_tokens BIGINT, cost_usd DOUBLE,
+                timestamp VARCHAR, quota_used_pct DOUBLE, quota_resets_at BIGINT,
+                quota_window_minutes INTEGER, quota_limit_id VARCHAR, pricing VARCHAR
+            )
+        """)
+        # $30 of usage on the first login, then $10 after switching to the second login,
+        # whose week began before the switch.
+        db.executemany(
+            "INSERT INTO tokens VALUES ('Claude Code', 'claude-opus-5-5', '', 'native', "
+            "0, 0, 0, 0, 100, ?, ?, NULL, NULL, NULL, NULL, 'model-prices')",
+            [(30.0, "2026-10-02T20:00:00Z"), (10.0, "2026-10-03T05:00:00Z")],
+        )
+        with connect(tmp_path / "quota.sqlite3") as connection:
+            insert_samples(connection, [
+                # The first login, recorded before snapshots named their login.
+                *_claude_snapshot("2026-10-03T01:00:00Z", 60, "2026-10-06T13:00:00Z"),
+                # The second login: one snapshot before labeling, then a labeled one.
+                *_claude_snapshot("2026-10-03T01:20:00Z", 5, "2026-10-09T14:00:00Z"),
+                *_claude_snapshot("2026-10-03T06:00:00Z", 25, "2026-10-09T14:00:00Z", "org-two"),
+            ])
+            report = build_quota_history(db, "cost_usd", "test-rate-card", connection)
+            relabeled = tuple(connection.execute(
+                "SELECT account_key FROM quota_samples WHERE effective_at LIKE '2026-10-03T01:20%'"
+            ).fetchone())
+
+        assert relabeled == ("org-two",)
+        weeks = {item["account"]: item for item in report["periods"] if item["limit_id"].split(":")[-1] == "1w"}
+        assert set(weeks) == {"default", "org-two"}
+        # Each login's week counts only its own usage, split at the first login's last snapshot.
+        assert weeks["default"]["api_equivalent_cost_usd"] == 30
+        assert weeks["org-two"]["api_equivalent_cost_usd"] == 10
+        value = build_value_report(report, {"Claude Code": ("max_20x", 200.0)},
+                                   labels={("anthropic", "org-two"): "second"})
+        assert [(item["account"], item["account_label"], item["full_week_api_equivalent_usd"])
+                for item in value["tools"]] == [("default", None, 50.0), ("org-two", "second", 40.0)]
+        capsys = self.capsys
+        print_value_report(value)
+        output = capsys.readouterr().out
+        assert re.search(r"Claude Code\s+second\s+max_20x", output)
+        assert re.search(r"Claude Code\s+default\s+max_20x", output)
+
+    def test_quota_history_counts_aop_runs_on_the_same_subscription(self):
+        db = duckdb.connect()
+        db.execute("""
+            CREATE TABLE tokens (
+                tool VARCHAR, model VARCHAR, rate_mode VARCHAR, source_kind VARCHAR,
+                input_tokens BIGINT, output_tokens BIGINT, cache_write_tokens BIGINT,
+                cache_read_tokens BIGINT, total_tokens BIGINT, cost_usd DOUBLE,
+                timestamp VARCHAR, quota_used_pct DOUBLE, quota_resets_at BIGINT,
+                quota_window_minutes INTEGER, quota_limit_id VARCHAR
+            )
+        """)
+        reset = int(datetime(2026, 8, 20, tzinfo=timezone.utc).timestamp())
+        db.executemany(
+            "INSERT INTO tokens VALUES ('Codex', 'gpt-5.6-sol', '', ?, 0, 0, 0, 0, 100, ?, ?, ?, ?, ?, ?)",
+            [
+                ("native", 10.0, "2026-08-14T00:00:00Z", 40, reset, 10080, "codex"),
+                ("aop", 10.0, "2026-08-15T00:00:00Z", None, None, None, None),
+                ("aop", None, "2026-08-16T00:00:00Z", None, None, None, None),
+                ("native", 0.0, "2026-08-19T00:00:00Z", 50, reset, 10080, "codex"),
+            ],
+        )
+
+        db.execute("""
+            ALTER TABLE tokens ADD COLUMN pricing VARCHAR;
+            UPDATE tokens SET pricing = CASE WHEN cost_usd IS NULL THEN 'unpriced' ELSE 'model-prices' END;
+        """)
+        period, = build_quota_history(db, "cost_usd", "test-rate-card")["periods"]
+
+        assert period["api_equivalent_cost_usd"] == 20
+        assert period["total_tokens"] == 400
+        assert period["full_quota_api_equivalent_cost_estimate_usd"] == 40
+        assert {item["pricing"] for item in period["model_mix"]} == {"model-prices", "unpriced"}
+        assert "unpriced_models" in period["pricing_flags"]
+
+    def test_quota_history_names_the_plan_each_period_reported(self):
+        tmp_path = self.tmp_path
+        db = duckdb.connect()
+        db.execute("""
+            CREATE TABLE tokens (
+                tool VARCHAR, model VARCHAR, rate_mode VARCHAR, source_kind VARCHAR,
+                input_tokens BIGINT, output_tokens BIGINT, cache_write_tokens BIGINT,
+                cache_read_tokens BIGINT, total_tokens BIGINT, cost_usd DOUBLE,
+                timestamp VARCHAR, quota_used_pct DOUBLE, quota_resets_at BIGINT,
+                quota_window_minutes INTEGER, quota_limit_id VARCHAR, quota_plan VARCHAR,
+                pricing VARCHAR
+            )
+        """)
+        first = int(datetime(2026, 10, 10, 5, 24, tzinfo=timezone.utc).timestamp())
+        db.executemany(
+            "INSERT INTO tokens VALUES ('Codex', 'gpt-5.5', '', 'native', 0, 0, 0, 0, 100, 1.0, "
+            "?, ?, ?, 10080, 'codex', ?, 'model-prices')",
+            [("2026-10-04T00:00:00Z", 20, first, "pro"),
+             ("2026-10-06T00:00:00Z", 35, first, "pro"),
+             ("2026-10-12T03:00:00Z", 5, first + 7 * 86400, "plus")],
+        )
+        with connect(tmp_path / "quota.sqlite3") as connection:
+            insert_samples(connection, _claude_snapshot(
+                "2026-10-05T00:00:00Z", 40, "2026-10-09T14:00:00Z", "org-one"))
+            report = build_quota_history(db, "cost_usd", "test", connection)
+
+        assert [(period["tool"], period["plan"]) for period in report["periods"]] == [
+            ("Claude Code", "max_20x"), ("Codex", "pro"), ("Codex", "plus")]
+
+    def test_value_report_prices_a_week_at_the_plan_it_ran_on(self):
+        week = _history_period("Codex", "2026-10-10T05:24:00Z", 36, 510.0, 1_000_000_000, [])
+        history = {"pricing_basis": "test", "periods": [{**week, "plan": "pro"}]}
+
+        def plan(current, forced=()):
+            item = build_value_report(history, {"Codex": current}, forced)["tools"][0]
+            return item["plan"], item["plan_usd_per_month"]
+
+        # A downgrade after the week ended does not reprice it.
+        assert plan(("plus", 20)) == ("pro", 200)
+        # Codex reports every Pro tier as "pro", so a configured tier names it exactly.
+        assert plan(("pro_100", 100)) == ("pro_100", 100)
+        # --plan applies to every week.
+        assert plan(("plus", 20), forced={"Codex"}) == ("plus", 20)
+        # A week whose snapshots named no plan uses the current one.
+        history["periods"][0]["plan"] = None
+        assert plan(("plus", 20)) == ("plus", 20)
+
+    def test_value_report_uses_the_latest_week_above_minimum_usage(self):
+        history = {"pricing_basis": "test", "periods": [
+            _history_period("Claude Code", "2026-09-22T13:00:00Z", 90, 900.0, 1_000_000_000, []),
+            _history_period("Claude Code", "2026-09-29T13:00:00Z", 50, 1000.0, 1_000_000_000, []),
+            _history_period("Claude Code", "2026-10-06T13:00:00Z", 15, 50.0, 10_000_000, []),
+            _history_period("Claude Code", "2026-10-01T00:00:00Z", 100, 5.0, 1000, [],
+                            window_minutes=300),
+            _history_period("Agy", "2026-09-30T00:00:00Z", 20, 3.0, 5_000_000,
+                            ["fallback_pricing"]),
+            _history_period("Codex", "2026-09-30T00:00:00Z", 10, 3.0, 5_000_000, []),
+        ]}
+
+        report = build_value_report(history, {"Claude Code": ("max_20x", 200), "Gemini": ("ultra", 250)})
+
+        agy, claude = report["tools"]
+        assert claude["resets_at"] == "2026-09-29T13:00:00Z"
+        assert claude["full_week_api_equivalent_usd"] == 2000
+        assert claude["monthly_api_equivalent_usd"] == approx(2000 * 365.25 / 84)
+        assert claude["api_equivalent_multiple"] == approx(2000 * 365.25 / 84 / 200)
+        assert claude["api_usd_per_million_tokens"] == approx(1.0)
+        assert claude["effective_usd_per_million_tokens"] == approx(
+            1.0 / claude["api_equivalent_multiple"]
+        )
+        assert agy["plan"] == "ultra"
+        assert agy["pricing_flags"] == ["fallback_pricing"]
