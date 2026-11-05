@@ -1082,9 +1082,13 @@ stored AS (
             as reasoning_output,
         try_cast(json_extract_string(
             result_json, '$.calculated_cost.amount_usd') as DOUBLE) as cost_usd,
-        -- The project is the directory that owns the run's .aop.
+        -- The directory that owns the run's .aop, the project when the result names no
+        -- project_dir.
         regexp_extract(json_extract_string(result_json, '$.state_root'),
-                       '^(.*)/[.]aop/?$', 1) as owner_path
+                       '^(.*)/[.]aop/?$', 1) as owner_path,
+        -- The directory the run worked in, recorded since AOP 0.6.1; a sealed run, which
+        -- works in its own empty workspace, and older results have none.
+        nullif(rtrim(json_extract_string(result_json, '$.project_dir'), '/'), '') as project_dir
     FROM raw
 ),
 normalized AS (
@@ -1123,7 +1127,7 @@ SELECT
         WHEN 'muse' THEN 'Muse'
         ELSE coalesce(nullif(provider, ''), 'AOP')
     END as tool,
-    lower(regexp_extract(owner_path, '([^/]+)$', 1)) as project,
+    lower(regexp_extract(coalesce(project_dir, owner_path), '([^/]+)$', 1)) as project,
     coalesce(nullif(session_id, ''), run_id) as session,
     left(timestamp, 10) as date,
     coalesce(model, '') as model,
@@ -1134,7 +1138,7 @@ SELECT
     (uncached_input + cached_input + cache_write_input + processed_output)::BIGINT
         as total_tokens,
     'subagent' as execution_type,
-    owner_path || '/.aop/worktrees/' || coalesce(nullif(task, ''), run_id)
+    coalesce(project_dir, owner_path) || '/.aop/worktrees/' || coalesce(nullif(task, ''), run_id)
         as project_path,
     'exact' as token_count_type,
     1 as turn_count,

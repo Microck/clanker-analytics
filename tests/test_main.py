@@ -903,6 +903,15 @@ class TestAOPSourceLoader(Case):
         assert row["project"] == "sycophant"
         assert row["project_path"] == "/code/Sycophant/.aop/worktrees/task-1"
 
+        # A run that worked in another directory, as AOP 0.6.1 records in project_dir.
+        result = json.loads(archive.read_text())
+        archive.write_text(json.dumps({**result, "project_dir": "/code/w3sim-r5c/"}))
+        relation = duckdb.sql(main_mod._aop_sql(main_mod._sql_literal(archive.as_posix())))
+        row = dict(zip([item[0] for item in relation.description], relation.fetchone()))
+
+        assert row["project"] == "w3sim-r5c"
+        assert row["project_path"] == "/code/w3sim-r5c/.aop/worktrees/task-1"
+
     def test_archived_copy_replaces_cached_rows_of_its_deleted_run_directory(self):
         tmp_path = self.tmp_path
         monkeypatch = self.monkeypatch
