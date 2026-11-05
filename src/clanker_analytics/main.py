@@ -91,6 +91,15 @@ MUSE_TOOL = "Muse"
 OPENCODE_TOOL = "OpenCode"
 
 
+def _opencode_database(home: Path) -> tuple[Path, str]:
+    """The directory and glob of OpenCode's databases."""
+    chosen = os.environ.get("OPENCODE_DB")
+    if chosen:
+        path = home / Path(chosen).expanduser()
+        return path.parent, path.name
+    return home, "opencode*.db"
+
+
 def _gemini_home() -> Path:
     return Path(os.environ.get("GEMINI_CLI_HOME") or HOME).expanduser()
 
@@ -135,7 +144,9 @@ def _home_trees() -> list[tuple[str, Path, str]]:
         (ZCODE_TOOL, Path(HOME) / ".zcode" / "cli" / "db", "db.sqlite"),
         # A session's log and each subagent's, under sessions/YYYY/MM/DD/<session>/.
         (MUSE_TOOL, data / "muse" / "sessions", "session.jsonl"),
-        (OPENCODE_TOOL, data / "opencode", "opencode.db"),
+        # OpenCode names its database per release channel, opencode.db on the default
+        # ones, and OPENCODE_DB names another, relative to its data directory.
+        (OPENCODE_TOOL, *_opencode_database(data / "opencode")),
     ]
 
 
@@ -1182,11 +1193,13 @@ OPENCODE_USAGE_COLUMNS = """
     output_tokens BIGINT,
     reasoning_tokens BIGINT,
     cache_read_tokens BIGINT,
-    cache_write_tokens BIGINT
+    cache_write_tokens BIGINT,
+    total_tokens BIGINT
 """
 
-# Each assistant message records the usage of the model call that wrote it; input is
-# uncached, and reasoning is counted apart from output.
+# Each assistant message records the usage of the model call that wrote it, with uncached
+# input. Reasoning is counted apart from output for most providers but inside it for
+# OpenAI's, so output is taken as the total less input and cache, which holds either way.
 OPENCODE_USAGE_QUERY = """
     SELECT m.id, m.session_id, s.parent_id,
            coalesce(json_extract(m.data, '$.path.root'), s.directory),
@@ -1197,7 +1210,8 @@ OPENCODE_USAGE_QUERY = """
            coalesce(json_extract(m.data, '$.tokens.output'), 0),
            coalesce(json_extract(m.data, '$.tokens.reasoning'), 0),
            coalesce(json_extract(m.data, '$.tokens.cache.read'), 0),
-           coalesce(json_extract(m.data, '$.tokens.cache.write'), 0)
+           coalesce(json_extract(m.data, '$.tokens.cache.write'), 0),
+           json_extract(m.data, '$.tokens.total')
     FROM message m LEFT JOIN session s ON s.id = m.session_id
     WHERE json_extract(m.data, '$.role') = 'assistant'
       AND json_extract(m.data, '$.tokens') IS NOT NULL
@@ -1232,11 +1246,10 @@ SELECT
     strftime(epoch_ms(created_at), '%Y-%m-%d') as date,
     model,
     input_tokens::INT as input_tokens,
-    (output_tokens + reasoning_tokens)::INT as output_tokens,
+    output::INT as output_tokens,
     cache_write_tokens::INT as cache_write_tokens,
     cache_read_tokens::INT as cache_read_tokens,
-    (input_tokens + output_tokens + reasoning_tokens + cache_read_tokens
-      + cache_write_tokens)::BIGINT as total_tokens,
+    (input_tokens + output + cache_read_tokens + cache_write_tokens)::BIGINT as total_tokens,
     CASE WHEN parent_session_id IS NOT NULL THEN 'subagent' ELSE 'interactive' END
         as execution_type,
     replace(directory, '\\', '/') as project_path,
@@ -1253,8 +1266,14 @@ SELECT
     NULL::INTEGER as quota_window_minutes,
     NULL::VARCHAR as quota_limit_id,
     message_id
-FROM {OPENCODE_USAGE_TABLE}
-WHERE input_tokens + output_tokens + reasoning_tokens + cache_read_tokens + cache_write_tokens > 0
+FROM (
+    SELECT *, CASE
+        WHEN total_tokens >= input_tokens + cache_read_tokens + cache_write_tokens
+        THEN total_tokens - input_tokens - cache_read_tokens - cache_write_tokens
+        ELSE output_tokens + reasoning_tokens END as output
+    FROM {OPENCODE_USAGE_TABLE}
+)
+WHERE input_tokens + output + cache_read_tokens + cache_write_tokens > 0
 """
 
 
@@ -2585,7 +2604,7 @@ def _session_sources(session: str) -> dict[str, SourceSnapshot]:
         "Agy": [f"{prefix}*/.system_generated/logs/transcript_full.jsonl"],
         MUSE_TOOL: [f"*/*/*/{prefix}*/session.jsonl", f"*/*/*/{prefix}*/subagent/*/session.jsonl"],
         ZCODE_TOOL: ["db.sqlite"],
-        OPENCODE_TOOL: ["opencode.db"],
+        OPENCODE_TOOL: ["opencode*.db"],
     }
     roots = {(tool, root) for tool, root, _ in _iter_source_trees() if tool in patterns}
     found: dict[str, SourceSnapshot] = {}

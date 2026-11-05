@@ -824,6 +824,13 @@ class TestSourceLoaders(Case):
                 1793717239181)),
             ("msg_2", "ses_child", assistant("glm-5.3-flash", {"total": 30, "input": 10,
                 "output": 20, "reasoning": 0, "cache": {"write": 0, "read": 0}}, 1793717240000)),
+            # OpenAI's output already includes its reasoning; the total says so.
+            ("msg_4", "ses_main", assistant("gpt-5.3-codex", {"total": 1150, "input": 100,
+                "output": 50, "reasoning": 30, "cache": {"write": 0, "read": 1000}},
+                1793717241000)),
+            # Without a total, reasoning is added to output.
+            ("msg_5", "ses_main", assistant("glm-5.3-flash", {"input": 10, "output": 20,
+                "reasoning": 5, "cache": {"write": 0, "read": 0}}, 1793717242000)),
             ("msg_3", "ses_main", json.dumps({"role": "user", "time": {"created": 1793717230000}})),
         ])
         source.commit()
@@ -840,7 +847,9 @@ class TestSourceLoaders(Case):
                  row["output_tokens"], row["cache_read_tokens"], row["total_tokens"])
                 for row in rows] == [
             ("w3sim-r5d", "opencode-go/kimi-k3.1-pro", "interactive", 712, 253, 171520, 172485),
-            ("w3sim-r5d", "opencode-go/glm-5.3-flash", "subagent", 10, 20, 0, 30)]
+            ("w3sim-r5d", "opencode-go/glm-5.3-flash", "subagent", 10, 20, 0, 30),
+            ("w3sim-r5d", "opencode-go/gpt-5.3-codex", "interactive", 100, 50, 1000, 1150),
+            ("w3sim-r5d", "opencode-go/glm-5.3-flash", "interactive", 10, 25, 0, 35)]
         assert rows[0]["timestamp"] == "2026-11-03T14:47:20.181Z"
 
     def test_gemini_timestamp_schema_shape_is_cast_before_slicing(self):

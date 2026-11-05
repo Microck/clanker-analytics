@@ -14,7 +14,7 @@ import clanker_analytics.main as main_mod
 from support import Case
 
 HARNESSES = Path(__file__).with_name("harnesses.toml")
-HARNESSES_COMMIT = "9a696e4"
+HARNESSES_COMMIT = "4bbed9a"
 READER = "clanker-analytics"
 
 # Spec sheet entry -> the tool its usage is reported as.
