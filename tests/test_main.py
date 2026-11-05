@@ -828,9 +828,11 @@ class TestSourceLoaders(Case):
             ("msg_4", "ses_main", assistant("gpt-5.3-codex", {"total": 1150, "input": 100,
                 "output": 50, "reasoning": 30, "cache": {"write": 0, "read": 1000}},
                 1793717241000)),
-            # Without a total, reasoning is added to output.
-            ("msg_5", "ses_main", assistant("glm-5.3-flash", {"input": 10, "output": 20,
-                "reasoning": 5, "cache": {"write": 0, "read": 0}}, 1793717242000)),
+            # Without a total, reasoning is added to output. Outside a repository OpenCode
+            # records the root as /, and the session's directory names the project.
+            ("msg_5", "ses_main", json.dumps({**json.loads(assistant("glm-5.3-flash", {
+                "input": 10, "output": 20, "reasoning": 5, "cache": {"write": 0, "read": 0}},
+                1793717242000)), "path": {"cwd": "/code/w3sim-r5d", "root": "/"}})),
             ("msg_3", "ses_main", json.dumps({"role": "user", "time": {"created": 1793717230000}})),
         ])
         source.commit()

@@ -1202,7 +1202,8 @@ OPENCODE_USAGE_COLUMNS = """
 # OpenAI's, so output is taken as the total less input and cache, which holds either way.
 OPENCODE_USAGE_QUERY = """
     SELECT m.id, m.session_id, s.parent_id,
-           coalesce(json_extract(m.data, '$.path.root'), s.directory),
+           -- The repository root, which is / outside a repository; else the session's directory.
+           coalesce(nullif(json_extract(m.data, '$.path.root'), '/'), s.directory),
            json_extract(m.data, '$.providerID') || '/' || json_extract(m.data, '$.modelID'),
            coalesce(json_extract(m.data, '$.time.completed'), json_extract(m.data, '$.time.created'),
                     m.time_created),
@@ -2466,10 +2467,36 @@ def register_macros(db: duckdb.DuckDBPyConnection) -> None:
     """)
 
 
+@contextmanager
+def _cache_lock(timer: DebugTimer):
+    """Hold the cache's lock file, waiting while another clanker-analytics process holds
+    it, so concurrent runs neither write the cache at once nor read it half written."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CACHE_DIR / "tokens.lock", "a+b") as lock, timer.span("wait for cache lock"):
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    continue
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def load_tokens(db: duckdb.DuckDBPyConnection, refresh: bool,
                 timing: DebugTimer | None = None) -> None:
     """Load tokens table from cache or rebuild from source files."""
     timer = timing or DebugTimer(False)
+    with _cache_lock(timer):
+        _load_tokens(db, refresh, timer)
+
+
+def _load_tokens(db: duckdb.DuckDBPyConnection, refresh: bool, timer: DebugTimer) -> None:
     files, dir_count, scan_seconds = scan_source_files()
     timer.record("scan source mtimes", scan_seconds,
                  f"{len(files)} files in {dir_count} dirs")
